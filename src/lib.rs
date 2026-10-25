@@ -1,7 +1,9 @@
 //! Local S3 core. Synchronous and SQLite-backed; callers supply Unix milliseconds.
 pub mod checksum;
 mod cors;
+mod lifecycle;
 mod multipart;
+mod notification;
 mod schema;
 pub mod server;
 mod tagging;
@@ -9,7 +11,15 @@ mod versions;
 
 pub use checksum::{Checksum, ChecksumAlgorithm, ChecksumInput};
 pub use cors::{CorsRule, MAX_CORS_RULES, find_cors_rule};
+pub use lifecycle::{
+    Expiration, LifecycleFilter, LifecycleRule, LifecycleRun, MAX_LIFECYCLE_RULES,
+    NoncurrentExpiration, parse_iso8601,
+};
 pub use multipart::{CompletedPart, PartInfo, UploadInfo};
+use notification::{EventObject, Principal, emit};
+pub use notification::{
+    MAX_DELIVERY_ATTEMPTS, NotificationStats, PendingNotification, QueueConfiguration,
+};
 pub use tagging::{MAX_BUCKET_TAGS, MAX_OBJECT_TAGS, Tags, tags_from_pairs};
 pub use versions::{VersionEntry, VersionListRequest, VersionListResult};
 
@@ -558,6 +568,15 @@ impl Ls2 {
                 params![id, data.len() as i64, data],
             )?;
         }
+        let object = EventObject::created(&info);
+        emit(
+            &tx,
+            bucket,
+            "ObjectCreated:Put",
+            &object,
+            Principal::Request,
+            now_ms,
+        )?;
         tx.commit()?;
         Ok(info)
     }
@@ -639,7 +658,7 @@ impl Ls2 {
     ) -> Result<DeleteOutcome, Error> {
         let tx = self.write_tx()?;
         let versioning = bucket_versioning(&tx, bucket)?;
-        let outcome = delete_in(&tx, bucket, key, version_id, versioning, now_ms)?;
+        let outcome = delete_and_notify(&tx, bucket, key, version_id, versioning, now_ms)?;
         tx.commit()?;
         Ok(outcome)
     }
@@ -657,7 +676,7 @@ impl Ls2 {
         for o in objects {
             results.push(match validate_key(&o.key) {
                 Ok(()) => {
-                    match delete_in(
+                    match delete_and_notify(
                         &tx,
                         bucket,
                         &o.key,
@@ -738,6 +757,15 @@ impl Ls2 {
                 params![id, src_id],
             )?;
         }
+        let object = EventObject::created(&info);
+        emit(
+            &tx,
+            dst_bucket,
+            "ObjectCreated:Copy",
+            &object,
+            Principal::Request,
+            now_ms,
+        )?;
         tx.commit()?;
         Ok((info, src.version_id))
     }
@@ -1088,7 +1116,7 @@ fn delete_in(
     version_id: Option<&str>,
     versioning: Option<Versioning>,
     now_ms: i64,
-) -> Result<DeleteOutcome, Error> {
+) -> Result<(DeleteOutcome, bool), Error> {
     if let Some(v) = version_id {
         validate_version_id(v)?;
         let removed = load_version(conn, bucket, key, v)?;
@@ -1097,20 +1125,23 @@ fn delete_in(
             params![bucket, key.as_bytes(), v],
         )?;
         refresh_latest(conn, bucket, key)?;
-        return Ok(DeleteOutcome {
+        let existed = removed.is_some();
+        let outcome = DeleteOutcome {
             version_id: Some(v.into()),
             delete_marker: removed.is_some_and(|r| r.delete_marker),
-        });
+        };
+        return Ok((outcome, existed));
     }
     if versioning.is_none() {
-        conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM objects WHERE bucket=?1 AND key=?2",
             params![bucket, key.as_bytes()],
         )?;
-        return Ok(DeleteOutcome {
+        let outcome = DeleteOutcome {
             version_id: None,
             delete_marker: false,
-        });
+        };
+        return Ok((outcome, deleted > 0));
     }
     // Versioned: a delete marker becomes the latest version (even for a missing key).
     let marker = ObjectInfo {
@@ -1125,10 +1156,33 @@ fn delete_in(
         tags: Tags::new(),
     };
     insert_row(conn, &marker, true, versioning)?;
-    Ok(DeleteOutcome {
+    let outcome = DeleteOutcome {
         version_id: Some(marker.version_id),
         delete_marker: true,
-    })
+    };
+    Ok((outcome, true))
+}
+
+/// DeleteObject as requested by a client, with its `ObjectRemoved` event.
+fn delete_and_notify(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    versioning: Option<Versioning>,
+    now_ms: i64,
+) -> Result<DeleteOutcome, Error> {
+    let (outcome, existed) = delete_in(conn, bucket, key, version_id, versioning, now_ms)?;
+    if existed {
+        let event = if version_id.is_none() && outcome.delete_marker {
+            "ObjectRemoved:DeleteMarkerCreated"
+        } else {
+            "ObjectRemoved:Delete"
+        };
+        let object = EventObject::removed(key, outcome.version_id.as_deref());
+        emit(conn, bucket, event, &object, Principal::Request, now_ms)?;
+    }
+    Ok(outcome)
 }
 
 pub(crate) fn check_write_condition(

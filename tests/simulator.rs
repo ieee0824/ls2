@@ -925,7 +925,7 @@ fn object_and_bucket_tags() {
             tags(&[("env", "dev"), ("team", "s3")])
         )
     );
-    s.put_object_tagging("bkt", "k", None, tags(&[("only", "one")]))
+    s.put_object_tagging("bkt", "k", None, tags(&[("only", "one")]), T)
         .unwrap();
     assert_eq!(
         s.head_object("bkt", "k", None).unwrap().tags,
@@ -960,7 +960,7 @@ fn object_and_bucket_tags() {
     // Tags apply per version.
     s.set_bucket_versioning("bkt", Versioning::Enabled).unwrap();
     let v1 = put(&mut s, "bkt", "k", b"v1");
-    s.put_object_tagging("bkt", "k", Some(&v1.version_id), tags(&[("v", "1")]))
+    s.put_object_tagging("bkt", "k", Some(&v1.version_id), tags(&[("v", "1")]), T)
         .unwrap();
     assert_eq!(
         s.get_object_tagging("bkt", "k", Some(NULL_VERSION))
@@ -968,7 +968,7 @@ fn object_and_bucket_tags() {
             .1,
         tags(&[("only", "one")])
     );
-    s.delete_object_tagging("bkt", "k", None).unwrap();
+    s.delete_object_tagging("bkt", "k", None, T).unwrap();
     assert!(s.get_object_tagging("bkt", "k", None).unwrap().1.is_empty());
 
     // Multipart uploads apply their tags on completion.

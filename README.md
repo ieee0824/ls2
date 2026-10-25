@@ -19,12 +19,14 @@ cargo run --locked
 | `LS2_DATABASE_PATH` | `ls2.sqlite` | SQLite ファイル |
 | `LS2_ALLOW_UNAUTHENTICATED_REMOTE` | `false` | `true` で loopback 以外への bind を許可（認証なしで公開されます） |
 | `LS2_VIRTUAL_HOST_DOMAINS` | `localhost` | virtual-hosted style として扱うドメイン（カンマ区切り）。`<bucket>.<domain>` の Host をバケットとみなします |
+| `LS2_SQS_ENDPOINT` | 未設定 | イベント通知の送信先（[lqs](https://github.com/ieee0824/lqs) など SQS JSON プロトコルの `http://host:port`）。未設定では通知設定を受け付けません |
+| `LS2_LIFECYCLE_INTERVAL_SECONDS` | `60` | ライフサイクルルールを適用する間隔。`0` で自動適用を止め、`POST /_ls2/lifecycle` でだけ適用します |
 
 既定では loopback でのみ起動します。停止・再起動後もデータは残ります。
 
 ```sh
 curl --fail http://127.0.0.1:9326/_ls2/health
-curl --fail http://127.0.0.1:9326/_ls2/status   # バケットごとのオブジェクト数・サイズ・未完了アップロード数
+curl --fail http://127.0.0.1:9326/_ls2/status   # バケットごとのオブジェクト数・サイズ・未完了アップロード数、未送信の通知
 ```
 
 ### Docker
@@ -34,7 +36,7 @@ docker build -t ls2 .
 docker run --rm -p 127.0.0.1:9326:9326 -v ls2-data:/data ls2
 ```
 
-イメージは `LS2_BIND_ADDR=0.0.0.0:9326`・`LS2_ALLOW_UNAUTHENTICATED_REMOTE=true`・`LS2_DATABASE_PATH=/data/ls2.sqlite` で起動します。認証がないため、ポートは `127.0.0.1` に限定して公開してください。データはボリューム `/data` に残ります。
+イメージは `LS2_BIND_ADDR=0.0.0.0:9326`・`LS2_ALLOW_UNAUTHENTICATED_REMOTE=true`・`LS2_DATABASE_PATH=/data/ls2.sqlite` で起動します。認証がないため、ポートは `127.0.0.1` に限定して公開してください。データはボリューム `/data` に残ります。lqs のコンテナへ通知する場合は、同じ Docker ネットワークに置いて `-e LS2_SQS_ENDPOINT=http://<lqs のコンテナ名>:9324` を指定します。
 
 ## 閲覧画面
 
@@ -79,7 +81,9 @@ aws --endpoint-url http://127.0.0.1:9326 s3 ls --recursive s3://my-bucket
 | マルチパート | `CreateMultipartUpload` / `UploadPart` / `UploadPartCopy` / `CompleteMultipartUpload` / `AbortMultipartUpload` / `ListParts` / `ListMultipartUploads` |
 | タグ | `Put/Get/DeleteObjectTagging`（`versionId` 可）、`Put/Get/DeleteBucketTagging`、PutObject / CopyObject / CreateMultipartUpload の `x-amz-tagging` |
 | CORS | `Put/Get/DeleteBucketCors`、preflight（`OPTIONS`）、許可されたオリジンからのリクエストへの `Access-Control-*` |
-| LS2 独自 | `GET /_ls2/health`、`GET /_ls2/status`、`GET /_ls2/browse`（閲覧画面） |
+| ライフサイクル | `Put/Get/DeleteBucketLifecycleConfiguration`、GET / HEAD / PUT の `x-amz-expiration` |
+| 通知 | `Put/GetBucketNotificationConfiguration`（SQS キューへの送信） |
+| LS2 独自 | `GET /_ls2/health`、`GET /_ls2/status`、`GET /_ls2/browse`（閲覧画面）、`POST /_ls2/lifecycle`（ライフサイクルの即時適用） |
 
 - **Range**: `bytes=a-b` / `bytes=a-` / `bytes=-n`。範囲外は 416 `InvalidRange`。複数範囲は 501。
 - **条件付きリクエスト**: GET/HEAD の `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since`、書き込みの `If-None-Match: *` / `If-Match`、コピー元の `x-amz-copy-source-if-*`。
@@ -88,11 +92,22 @@ aws --endpoint-url http://127.0.0.1:9326 s3 ls --recursive s3://my-bucket
 - **バージョニング**: 有効化後の書き込みごとに新しいバージョン ID を付け、`versionId` なしの削除は削除マーカーを作ります。`GET` / `HEAD` / `DELETE` / `CopyObject`（`x-amz-copy-source: bucket/key?versionId=`）/ `UploadPartCopy` / `DeleteObjects` でバージョンを指定できます。有効化前のオブジェクトは `null` バージョンになり、停止（Suspended）中の書き込みは `null` バージョンを置き換えます。削除マーカーを読むと S3 と同じく 404（最新の場合）/ 405（バージョン指定の場合）と `x-amz-delete-marker: true` を返します。古いバージョンを同じキーへコピーすると復元できます。
 - **タグ**: オブジェクトは10個、バケットは50個まで。キーは128文字・値は256文字まで、使える文字や `aws:` の予約も S3 と同じく検証し、違反は `InvalidTag` です。CopyObject は `x-amz-tagging-directive: COPY`（既定）/ `REPLACE` に従います。タグ付きのオブジェクトの GET / HEAD は `x-amz-tagging-count` を返します。
 - **CORS**: ルールは先頭から評価し、オリジンと `AllowedHeader` の `*`（1つまで）に対応します。preflight はルールがないと 403、一致しないと 403 です。ブラウザから presigned URL で直接アップロードする開発に使えます。
+- **ライフサイクル**: `Expiration`（`Days` / `Date` / `ExpiredObjectDeleteMarker`）、`NoncurrentVersionExpiration`（`NewerNoncurrentVersions` 可）、`AbortIncompleteMultipartUpload` に対応します。フィルターは `Prefix` / `Tag` / `ObjectSizeGreaterThan` / `ObjectSizeLessThan` / `And` と旧形式の `Prefix` です。期限は S3 と同じく翌日 0 時（UTC）に切り上げます。バージョニング有効なバケットでは現行バージョンの期限切れで削除マーカーを作ります。`Transition` はストレージクラスが1つしかないため 501 です。
+- **ライフサイクルの適用**: サーバーは `LS2_LIFECYCLE_INTERVAL_SECONDS` ごとに現在時刻でルールを適用します。`curl -X POST 'http://127.0.0.1:9326/_ls2/lifecycle?now=2030-01-01T00:00:00Z'` のように時刻（ISO 8601 または Unix ミリ秒）を指定すると、日数の経過を待たずに確認できます。応答は削除した件数の JSON です。ブラウザからの呼び出し（`Origin` 付き）は拒否します。
+- **通知**: `QueueConfiguration` の `s3:ObjectCreated:*`（`Put` / `Copy` / `CompleteMultipartUpload`。POST アップロードは未対応のため `Post` は設定できても発生しません）、`s3:ObjectRemoved:*`（`Delete` / `DeleteMarkerCreated`）、`s3:ObjectTagging:*`、`s3:LifecycleExpiration:*` と prefix / suffix フィルターに対応します。本文は S3 と同じイベント形式（`eventVersion` 2.1、URL エンコードしたキー、`sequencer`）で、設定時には各キューへ `s3:TestEvent` を送ります。設定時に `GetQueueUrl` でキューの存在を確かめ、なければ `InvalidArgument` です（`x-amz-skip-destination-validation: true` で省略）。SNS・Lambda・EventBridge・FIFO キューは未対応です。
+
+```sh
+LS2_SQS_ENDPOINT=http://127.0.0.1:9324 cargo run --locked   # lqs を 9324 で起動しておく
+aws --endpoint-url http://127.0.0.1:9324 sqs create-queue --queue-name events
+aws --endpoint-url http://127.0.0.1:9326 s3api put-bucket-notification-configuration --bucket my-bucket \
+  --notification-configuration '{"QueueConfigurations":[{"QueueArn":"arn:aws:sqs:us-east-1:000000000000:events","Events":["s3:ObjectCreated:*"]}]}'
+```
+
 - **エラー**: S3 形式の XML（`Code` / `Message` / `RequestId`）と `x-amz-request-id` を返します。HEAD と 304 は本文なしです。
 
 ## 制約
 
-**未対応の機能は黙って無視せず `501 NotImplemented` を返します。** 例: MFA Delete、ACL・ポリシー、SSE、Object Lock、`STANDARD` 以外のストレージクラス、ライフサイクル、通知、`partNumber` 指定の GET。許可リストにない `x-amz-*` ヘッダーやクエリパラメーターも 501 になるため、ローカルでは成功したのに本番では意味が違う、というケースを減らせます。
+**未対応の機能は黙って無視せず `501 NotImplemented` を返します。** 例: MFA Delete、ACL・ポリシー、SSE、Object Lock、`STANDARD` 以外のストレージクラス、ライフサイクルの Transition、SNS / Lambda / EventBridge 通知、`partNumber` 指定の GET。許可リストにない `x-amz-*` ヘッダーやクエリパラメーターも 501 になるため、ローカルでは成功したのに本番では意味が違う、というケースを減らせます。
 
 - 1リクエストの本文は 256 MiB まで（超過は `EntityTooLarge`）。それより大きいオブジェクトはマルチパートで作成します。
 - GET は 1 MiB ずつ読み出してストリーミングします。ダウンロード中にオブジェクトが上書き・削除されると、古い内容と新しい内容を混ぜずに接続を打ち切ります（クライアントは短い本文として再試行します）。
@@ -101,7 +116,8 @@ aws --endpoint-url http://127.0.0.1:9326 s3 ls --recursive s3://my-bucket
 - us-east-1 のバケットを再作成すると成功し、ほかのリージョンでは `BucketAlreadyOwnedByYou` になります（S3 の挙動に合わせています）。`DeleteBucket` は未完了のマルチパートアップロードを一緒に破棄します。
 - バケットを削除するには、削除マーカーを含むすべてのバージョンを先に削除します（S3 と同じ）。
 - アカウントは1つだけです。`x-amz-expected-bucket-owner` は `000000000000` 以外を `AccessDenied` にします。
-- SQLite は平文保存で、自動削除はしません。HTTP からの操作は1接続で直列に処理します。
+- 通知は書き込みと同じトランザクションで SQLite の送信待ちに記録し、別タスクが送ります。送信に失敗しても書き込みは取り消さず、0.5 秒から最大 60 秒の間隔で10回まで再試行します（同じキューへの順序は保ちます）。諦めた件数と最後のエラーは `/_ls2/status` で確認できます。
+- SQLite は平文保存です。自動削除はライフサイクルルールによるものだけです。HTTP からの操作は1接続で直列に処理します。
 
 ## Rust ライブラリ
 
@@ -127,8 +143,10 @@ cargo clippy --locked --all-targets -- -D warnings
 # 別ターミナルで LS2 を起動した状態で実行
 bash integration/aws-cli.sh              # AWS CLI
 (cd integration && go test ./...)        # AWS SDK for Go v2（path-style と virtual-hosted style）
+# lqs への通知も確認する場合: lqs を起動し、LS2_SQS_ENDPOINT 付きで LS2 を起動してから
+(cd integration && LQS_ENDPOINT=http://127.0.0.1:9324 go test ./...)
 ```
 
-GitHub Actions では上記に加えて AWS CLI v2 と Docker イメージのビルドを確認します。
+GitHub Actions では上記に加えて lqs への通知、AWS CLI v2、Docker イメージのビルドを確認します。
 
 設計・拡張方針は [DESIGN.md](DESIGN.md) を参照してください。
