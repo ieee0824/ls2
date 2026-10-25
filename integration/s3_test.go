@@ -208,3 +208,75 @@ func runScenario(t *testing.T, client *s3.Client) {
 		t.Fatalf("DeleteBucket: %v", err)
 	}
 }
+
+func TestVersioning(t *testing.T) {
+	client := newClient(t, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	bucket := fmt.Sprintf("ls2-go-ver-%d", time.Now().UnixNano())
+	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	if _, err := client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket:                  aws.String(bucket),
+		VersioningConfiguration: &types.VersioningConfiguration{Status: types.BucketVersioningStatusEnabled},
+	}); err != nil {
+		t.Fatalf("PutBucketVersioning: %v", err)
+	}
+	status, err := client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucket)})
+	if err != nil || status.Status != types.BucketVersioningStatusEnabled {
+		t.Fatalf("GetBucketVersioning = %+v, %v", status, err)
+	}
+	var versions []string
+	for _, body := range []string{"one", "two"} {
+		out, err := client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String("k"), Body: strings.NewReader(body),
+		})
+		if err != nil || out.VersionId == nil {
+			t.Fatalf("PutObject(%s) = %+v, %v", body, out, err)
+		}
+		versions = append(versions, *out.VersionId)
+	}
+	deleted, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String("k")})
+	if err != nil || !aws.ToBool(deleted.DeleteMarker) {
+		t.Fatalf("DeleteObject = %+v, %v", deleted, err)
+	}
+	if _, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("k")}); err == nil {
+		t.Fatal("HeadObject after delete marker succeeded")
+	}
+	old, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"), VersionId: aws.String(versions[0]),
+	})
+	if err != nil {
+		t.Fatalf("GetObject(version): %v", err)
+	}
+	oldBody, _ := io.ReadAll(old.Body)
+	old.Body.Close()
+	if string(oldBody) != "one" || aws.ToString(old.VersionId) != versions[0] {
+		t.Fatalf("GetObject(version) = %q %v", oldBody, old.VersionId)
+	}
+
+	listed, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket)})
+	if err != nil || len(listed.Versions) != 2 || len(listed.DeleteMarkers) != 1 {
+		t.Fatalf("ListObjectVersions = %+v, %v", listed, err)
+	}
+	if !aws.ToBool(listed.DeleteMarkers[0].IsLatest) {
+		t.Fatalf("delete marker should be latest: %+v", listed.DeleteMarkers[0])
+	}
+
+	// Remove every version so the bucket can be deleted.
+	var ids []types.ObjectIdentifier
+	for _, v := range listed.Versions {
+		ids = append(ids, types.ObjectIdentifier{Key: v.Key, VersionId: v.VersionId})
+	}
+	for _, m := range listed.DeleteMarkers {
+		ids = append(ids, types.ObjectIdentifier{Key: m.Key, VersionId: m.VersionId})
+	}
+	removed, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: aws.String(bucket), Delete: &types.Delete{Objects: ids}})
+	if err != nil || len(removed.Deleted) != 3 {
+		t.Fatalf("DeleteObjects(versions) = %+v, %v", removed, err)
+	}
+	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+}

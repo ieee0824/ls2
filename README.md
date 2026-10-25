@@ -72,7 +72,8 @@ aws --endpoint-url http://127.0.0.1:9326 s3 ls --recursive s3://my-bucket
 
 | 分類 | API |
 | --- | --- |
-| バケット | `ListBuckets` / `CreateBucket` / `DeleteBucket` / `HeadBucket` / `GetBucketLocation` / `GetBucketVersioning`（常に未設定） |
+| バケット | `ListBuckets` / `CreateBucket` / `DeleteBucket` / `HeadBucket` / `GetBucketLocation` |
+| バージョニング | `PutBucketVersioning` / `GetBucketVersioning` / `ListObjectVersions`、各操作の `versionId`、削除マーカー |
 | オブジェクト | `PutObject` / `GetObject` / `HeadObject` / `DeleteObject` / `DeleteObjects` / `CopyObject` |
 | 一覧 | `ListObjectsV2` / `ListObjects`（prefix・delimiter・ページング・`encoding-type=url`） |
 | マルチパート | `CreateMultipartUpload` / `UploadPart` / `UploadPartCopy` / `CompleteMultipartUpload` / `AbortMultipartUpload` / `ListParts` / `ListMultipartUploads` |
@@ -83,17 +84,19 @@ aws --endpoint-url http://127.0.0.1:9326 s3 ls --recursive s3://my-bucket
 - **条件付きリクエスト**: GET/HEAD の `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since`、書き込みの `If-None-Match: *` / `If-Match`、コピー元の `x-amz-copy-source-if-*`。
 - **整合性**: `Content-MD5`、`x-amz-content-sha256`（16進値の場合）、フレキシブルチェックサム（CRC32 / CRC32C / CRC64NVME / SHA1 / SHA256）をヘッダー・`aws-chunked` トレーラーの両方で検証し、不一致は保存しません。チェックサム未指定の PutObject には S3 と同様に CRC64NVME を付与し、`x-amz-checksum-mode: ENABLED` の GET/HEAD で返します。
 - **メタデータ**: `Content-Type` / `Content-Encoding` / `Content-Disposition` / `Content-Language` / `Cache-Control` / `Expires` / `x-amz-meta-*`（合計 2 KiB まで）。GET の `response-*` クエリによる上書き。
+- **バージョニング**: 有効化後の書き込みごとに新しいバージョン ID を付け、`versionId` なしの削除は削除マーカーを作ります。`GET` / `HEAD` / `DELETE` / `CopyObject`（`x-amz-copy-source: bucket/key?versionId=`）/ `UploadPartCopy` / `DeleteObjects` でバージョンを指定できます。有効化前のオブジェクトは `null` バージョンになり、停止（Suspended）中の書き込みは `null` バージョンを置き換えます。削除マーカーを読むと S3 と同じく 404（最新の場合）/ 405（バージョン指定の場合）と `x-amz-delete-marker: true` を返します。古いバージョンを同じキーへコピーすると復元できます。
 - **エラー**: S3 形式の XML（`Code` / `Message` / `RequestId`）と `x-amz-request-id` を返します。HEAD と 304 は本文なしです。
 
 ## 制約
 
-**未対応の機能は黙って無視せず `501 NotImplemented` を返します。** 例: バージョニングの有効化、ACL・ポリシー、タグ設定、SSE、Object Lock、`STANDARD` 以外のストレージクラス、ライフサイクル、CORS、通知、`partNumber` 指定の GET。許可リストにない `x-amz-*` ヘッダーやクエリパラメーターも 501 になるため、ローカルでは成功したのに本番では意味が違う、というケースを減らせます。
+**未対応の機能は黙って無視せず `501 NotImplemented` を返します。** 例: MFA Delete、ACL・ポリシー、タグ設定、SSE、Object Lock、`STANDARD` 以外のストレージクラス、ライフサイクル、CORS、通知、`partNumber` 指定の GET。許可リストにない `x-amz-*` ヘッダーやクエリパラメーターも 501 になるため、ローカルでは成功したのに本番では意味が違う、というケースを減らせます。
 
 - 1リクエストの本文は 256 MiB まで（超過は `EntityTooLarge`）。それより大きいオブジェクトはマルチパートで作成します。
 - GET は 1 MiB ずつ読み出してストリーミングします。ダウンロード中にオブジェクトが上書き・削除されると、古い内容と新しい内容を混ぜずに接続を打ち切ります（クライアントは短い本文として再試行します）。
 - マルチパートは S3 と同じく最後以外のパートが 5 MiB 以上、パート番号 1〜10000 です。完成したオブジェクトにはオブジェクト単位のチェックサムを付けません（パート単位では検証します）。
 - CopyObject はコピー元の ETag とチェックサムを引き継ぎます（S3 ではマルチパート由来の ETag が変わる場合があります）。
 - us-east-1 のバケットを再作成すると成功し、ほかのリージョンでは `BucketAlreadyOwnedByYou` になります（S3 の挙動に合わせています）。`DeleteBucket` は未完了のマルチパートアップロードを一緒に破棄します。
+- バケットを削除するには、削除マーカーを含むすべてのバージョンを先に削除します（S3 と同じ）。
 - アカウントは1つだけです。`x-amz-expected-bucket-owner` は `000000000000` 以外を `AccessDenied` にします。
 - SQLite は平文保存で、自動削除はしません。HTTP からの操作は1接続で直列に処理します。
 

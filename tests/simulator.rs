@@ -3,8 +3,9 @@ use axum::{
     http::{Request, StatusCode},
 };
 use ls2::{
-    ByteRange, ChecksumAlgorithm, ChecksumInput, CompletedPart, Error, ListRequest, Ls2,
-    MIN_PART_SIZE, Metadata, PutOptions, ReadCondition, WriteCondition, checksum::Checksum,
+    ByteRange, ChecksumAlgorithm, ChecksumInput, CompletedPart, CopySource, DeleteOutcome, Error,
+    ListRequest, Ls2, MIN_PART_SIZE, Metadata, NULL_VERSION, ObjectId, PutOptions, ReadCondition,
+    VersionListRequest, Versioning, WriteCondition, checksum::Checksum,
 };
 use tower::ServiceExt;
 
@@ -19,6 +20,15 @@ fn ls2_with(bucket: &str) -> Ls2 {
 fn put(s: &mut Ls2, bucket: &str, key: &str, data: &[u8]) -> ls2::ObjectInfo {
     s.put_object(bucket, key, data, PutOptions::default(), T)
         .unwrap()
+}
+
+fn source(bucket: &str, key: &str, condition: ReadCondition) -> CopySource {
+    CopySource {
+        bucket: bucket.into(),
+        key: key.into(),
+        version_id: None,
+        condition,
+    }
 }
 
 fn list(s: &Ls2, prefix: &str, delimiter: &str, after: &str, max: usize) -> ls2::ListResult {
@@ -67,7 +77,7 @@ fn bucket_lifecycle() {
         s.delete_bucket("alpha"),
         Err(Error::BucketNotEmpty)
     ));
-    s.delete_object("alpha", "k").unwrap();
+    s.delete_object("alpha", "k", None, T).unwrap();
     s.delete_bucket("alpha").unwrap();
     assert!(matches!(s.bucket("alpha"), Err(Error::NoSuchBucket)));
     assert!(matches!(
@@ -103,7 +113,7 @@ fn put_get_head_and_ranges() {
         ChecksumAlgorithm::Crc64Nvme
     );
 
-    let head = s.head_object("bkt", "dir/hello.txt").unwrap();
+    let head = s.head_object("bkt", "dir/hello.txt", None).unwrap();
     assert_eq!((head.size, head.metadata), (11, metadata));
 
     let get = |range| {
@@ -151,11 +161,11 @@ fn put_get_head_and_ranges() {
     ));
 
     assert!(matches!(
-        s.head_object("bkt", "missing"),
+        s.head_object("bkt", "missing", None),
         Err(Error::NoSuchKey)
     ));
     assert!(matches!(
-        s.head_object("nope", "k"),
+        s.head_object("nope", "k", None),
         Err(Error::NoSuchBucket)
     ));
     put(&mut s, "bkt", "empty", b"");
@@ -190,7 +200,10 @@ fn integrity_failures_store_nothing() {
         s.put_object("bkt", "k", b"data", opts, T),
         Err(Error::BadDigest(_))
     ));
-    assert!(matches!(s.head_object("bkt", "k"), Err(Error::NoSuchKey)));
+    assert!(matches!(
+        s.head_object("bkt", "k", None),
+        Err(Error::NoSuchKey)
+    ));
 
     let right = Checksum::compute(ChecksumAlgorithm::Sha256, b"data");
     let opts = PutOptions {
@@ -344,7 +357,14 @@ fn listing_with_prefixes_and_pagination() {
     assert!(list(&s, "", "", "", 0).objects.is_empty());
 
     let deleted = s
-        .delete_objects("bkt", &["z/1".into(), "missing".into(), String::new()])
+        .delete_objects(
+            "bkt",
+            &["z/1", "missing", ""].map(|k| ObjectId {
+                key: k.into(),
+                version_id: None,
+            }),
+            T,
+        )
         .unwrap();
     assert!(deleted[0].is_ok() && deleted[1].is_ok() && deleted[2].is_err());
     assert_eq!(keys(&list(&s, "z/", "", "", 1000)), ["z/2"]);
@@ -377,7 +397,7 @@ fn copy_object_directives() {
         ..Default::default()
     };
     assert!(matches!(
-        s.copy_object("bkt", "src", &stale, "other", "dst", None, T),
+        s.copy_object(&source("bkt", "src", stale), "other", "dst", None, T),
         Err(Error::PreconditionFailed)
     ));
     let same = ReadCondition {
@@ -385,12 +405,19 @@ fn copy_object_directives() {
         ..Default::default()
     };
     assert!(matches!(
-        s.copy_object("bkt", "src", &same, "other", "dst", None, T),
+        s.copy_object(&source("bkt", "src", same), "other", "dst", None, T),
         Err(Error::PreconditionFailed)
     ));
     let copy = s
-        .copy_object("bkt", "src", &any, "other", "dst", None, T + 1)
-        .unwrap();
+        .copy_object(
+            &source("bkt", "src", any.clone()),
+            "other",
+            "dst",
+            None,
+            T + 1,
+        )
+        .unwrap()
+        .0;
     assert_eq!(
         (copy.etag.as_str(), &copy.metadata),
         (src.etag.as_str(), &src_meta)
@@ -403,7 +430,7 @@ fn copy_object_directives() {
     );
 
     assert!(matches!(
-        s.copy_object("bkt", "src", &any, "bkt", "src", None, T),
+        s.copy_object(&source("bkt", "src", any.clone()), "bkt", "src", None, T),
         Err(Error::InvalidRequest(_))
     ));
     let replaced = Metadata {
@@ -411,16 +438,17 @@ fn copy_object_directives() {
         ..Default::default()
     };
     s.copy_object(
-        "bkt",
-        "src",
-        &any,
+        &source("bkt", "src", any.clone()),
         "bkt",
         "src",
         Some(replaced.clone()),
         T + 2,
     )
     .unwrap();
-    assert_eq!(s.head_object("bkt", "src").unwrap().metadata, replaced);
+    assert_eq!(
+        s.head_object("bkt", "src", None).unwrap().metadata,
+        replaced
+    );
     assert_eq!(
         s.get_object("bkt", "src", None, &ReadCondition::default())
             .unwrap()
@@ -428,7 +456,7 @@ fn copy_object_directives() {
         b"payload"
     );
     assert!(matches!(
-        s.copy_object("bkt", "none", &any, "bkt", "x", None, T),
+        s.copy_object(&source("bkt", "none", any), "bkt", "x", None, T),
         Err(Error::NoSuchKey)
     ));
 }
@@ -566,15 +594,13 @@ fn multipart_rules() {
     let id = s
         .create_multipart_upload("bkt", "k", Metadata::default(), None, T)
         .unwrap();
-    let copied = s
+    let (copied, _) = s
         .upload_part_copy(
             "bkt",
             "k",
             &id,
             1,
-            "bkt",
-            "src",
-            &ReadCondition::default(),
+            &source("bkt", "src", ReadCondition::default()),
             Some(ByteRange::From {
                 start: 2,
                 end: Some(4),
@@ -659,7 +685,7 @@ fn incremental_reads_detect_replacement() {
         end: None,
     };
     let h = s
-        .open_object("bkt", "big", Some(range), &ReadCondition::default())
+        .open_object("bkt", "big", None, Some(range), &ReadCondition::default())
         .unwrap();
     assert_eq!(
         (h.start, h.end, h.partial),
@@ -673,6 +699,176 @@ fn incremental_reads_detect_replacement() {
     assert!(matches!(
         s.read_object(&h, h.start, 4),
         Err(Error::InvalidRequest(_))
+    ));
+}
+
+#[test]
+fn versioning_keeps_history_and_delete_markers() {
+    let mut s = ls2_with("bkt");
+    let before = put(&mut s, "bkt", "k", b"v0");
+    assert_eq!(before.version_id, NULL_VERSION);
+    s.set_bucket_versioning("bkt", Versioning::Enabled).unwrap();
+    let v1 = put(&mut s, "bkt", "k", b"v1");
+    let v2 = put(&mut s, "bkt", "k", b"v2");
+    assert_ne!(v1.version_id, v2.version_id);
+    assert_eq!(v1.version_id.len(), 32);
+
+    let read = |s: &Ls2, version: Option<&str>| {
+        let h = s.open_object("bkt", "k", version, None, &ReadCondition::default())?;
+        s.read_object(&h, 0, 100)
+    };
+    assert_eq!(read(&s, None).unwrap(), b"v2");
+    assert_eq!(read(&s, Some(&v1.version_id)).unwrap(), b"v1");
+    assert_eq!(read(&s, Some(NULL_VERSION)).unwrap(), b"v0");
+    assert!(matches!(
+        read(&s, Some("nope")),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        read(&s, Some(&"0".repeat(32))),
+        Err(Error::NoSuchVersion)
+    ));
+
+    // Deleting without a version adds a delete marker; the data stays.
+    let marker = s.delete_object("bkt", "k", None, T + 1).unwrap();
+    assert!(marker.delete_marker);
+    let marker_id = marker.version_id.clone().unwrap();
+    assert!(matches!(
+        read(&s, None),
+        Err(Error::DeleteMarker {
+            requested: false,
+            ..
+        })
+    ));
+    assert!(matches!(
+        read(&s, Some(&marker_id)),
+        Err(Error::DeleteMarker {
+            requested: true,
+            ..
+        })
+    ));
+    assert!(list(&s, "", "", "", 10).objects.is_empty());
+    assert!(matches!(s.delete_bucket("bkt"), Err(Error::BucketNotEmpty)));
+
+    let versions = s
+        .list_object_versions(
+            "bkt",
+            &VersionListRequest {
+                max_keys: 1000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ids: Vec<(&str, bool, bool)> = versions
+        .versions
+        .iter()
+        .map(|v| (v.info.version_id.as_str(), v.is_latest, v.delete_marker))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            (marker_id.as_str(), true, true),
+            (v2.version_id.as_str(), false, false),
+            (v1.version_id.as_str(), false, false),
+            (NULL_VERSION, false, false),
+        ]
+    );
+
+    // Removing the marker by version ID restores the previous version.
+    assert_eq!(
+        s.delete_object("bkt", "k", Some(&marker_id), T + 2)
+            .unwrap(),
+        DeleteOutcome {
+            version_id: Some(marker_id.clone()),
+            delete_marker: true
+        }
+    );
+    assert_eq!(read(&s, None).unwrap(), b"v2");
+    s.delete_object("bkt", "k", Some(&v2.version_id), T + 2)
+        .unwrap();
+    assert_eq!(read(&s, None).unwrap(), b"v1");
+
+    // Copying an old version creates a new latest version.
+    let mut src = source("bkt", "k", ReadCondition::default());
+    src.version_id = Some(NULL_VERSION.into());
+    let (copy, copied_from) = s.copy_object(&src, "bkt", "k", None, T + 3).unwrap();
+    assert_eq!(copied_from, NULL_VERSION);
+    assert_eq!(read(&s, None).unwrap(), b"v0");
+    assert_eq!(
+        s.head_object("bkt", "k", None).unwrap().version_id,
+        copy.version_id
+    );
+
+    // Suspended: writes replace the `null` version; other versions remain.
+    s.set_bucket_versioning("bkt", Versioning::Suspended)
+        .unwrap();
+    let null = put(&mut s, "bkt", "k", b"suspended");
+    assert_eq!(null.version_id, NULL_VERSION);
+    assert_eq!(read(&s, Some(&v1.version_id)).unwrap(), b"v1");
+    let marker = s.delete_object("bkt", "k", None, T + 4).unwrap();
+    assert_eq!(marker.version_id.as_deref(), Some(NULL_VERSION));
+    assert!(matches!(
+        read(&s, Some(NULL_VERSION)),
+        Err(Error::DeleteMarker {
+            requested: true,
+            ..
+        })
+    ));
+    assert_eq!(
+        s.bucket("bkt").unwrap().versioning,
+        Some(Versioning::Suspended)
+    );
+}
+
+#[test]
+fn version_listing_pages_and_groups() {
+    let mut s = ls2_with("bkt");
+    s.set_bucket_versioning("bkt", Versioning::Enabled).unwrap();
+    for key in ["a", "a", "dir/x", "dir/y", "z", "z", "z"] {
+        put(&mut s, "bkt", key, key.as_bytes());
+    }
+    let page = |key_marker: &str, version_marker: &str, delimiter: &str, max: usize| {
+        s.list_object_versions(
+            "bkt",
+            &VersionListRequest {
+                delimiter: delimiter.into(),
+                key_marker: key_marker.into(),
+                version_id_marker: version_marker.into(),
+                max_keys: max,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let (mut keys, mut prefixes) = (Vec::new(), Vec::new());
+    let (mut km, mut vm) = (String::new(), String::new());
+    loop {
+        let p = page(&km, &vm, "/", 2);
+        assert!(p.versions.len() + p.common_prefixes.len() <= 2);
+        keys.extend(p.versions.iter().map(|v| v.info.key.clone()));
+        prefixes.extend(p.common_prefixes.clone());
+        if !p.truncated {
+            break;
+        }
+        km = p.next_key_marker.unwrap();
+        vm = p.next_version_id_marker.unwrap_or_default();
+    }
+    assert_eq!(keys, ["a", "a", "z", "z", "z"]);
+    assert_eq!(prefixes, ["dir/"]);
+    let all = page("", "", "", 1000);
+    assert_eq!(all.versions.len(), 7);
+    assert!(all.versions.iter().filter(|v| v.is_latest).count() == 4);
+    assert!(matches!(
+        s.list_object_versions(
+            "bkt",
+            &VersionListRequest {
+                key_marker: "a".into(),
+                version_id_marker: "0".repeat(32),
+                max_keys: 10,
+                ..Default::default()
+            }
+        ),
+        Err(Error::InvalidArgument(_))
     ));
 }
 
@@ -1240,5 +1436,126 @@ async fn http_browse_pages() {
     assert_eq!(
         http.call("POST", "/_ls2/browse", Body::empty()).await.0,
         StatusCode::METHOD_NOT_ALLOWED
+    );
+}
+
+#[tokio::test]
+async fn http_versioning() {
+    let http = Http::new();
+    http.call("PUT", "/bucket", "").await;
+    let (_, _, body) = http.call("GET", "/bucket?versioning", Body::empty()).await;
+    assert!(!body.contains("<Status>"), "{body}");
+    let (_, headers, _) = http.call("PUT", "/bucket/k", "v0").await;
+    assert!(
+        !headers.contains_key("x-amz-version-id"),
+        "unversioned buckets send no version"
+    );
+
+    let enable = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(
+        http.call("PUT", "/bucket?versioning", enable).await.0,
+        StatusCode::OK
+    );
+    let (_, _, body) = http.call("GET", "/bucket?versioning", Body::empty()).await;
+    assert!(body.contains("<Status>Enabled</Status>"), "{body}");
+    let mfa = "<VersioningConfiguration><Status>Enabled</Status><MfaDelete>Enabled</MfaDelete></VersioningConfiguration>";
+    assert_eq!(
+        http.call("PUT", "/bucket?versioning", mfa).await.0,
+        StatusCode::NOT_IMPLEMENTED
+    );
+
+    let (_, headers, _) = http.call("PUT", "/bucket/k", "v1").await;
+    let v1 = headers["x-amz-version-id"].to_str().unwrap().to_owned();
+    let (_, headers, _) = http.call("HEAD", "/bucket/k", Body::empty()).await;
+    assert_eq!(headers["x-amz-version-id"], v1.as_str());
+    let (_, headers, body) = http
+        .call("GET", "/bucket/k?versionId=null", Body::empty())
+        .await;
+    assert_eq!(
+        (body.as_str(), &headers["x-amz-version-id"]),
+        ("v0", &"null".parse::<axum::http::HeaderValue>().unwrap())
+    );
+
+    let (status, headers, _) = http.call("DELETE", "/bucket/k", Body::empty()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(headers["x-amz-delete-marker"], "true");
+    let marker = headers["x-amz-version-id"].to_str().unwrap().to_owned();
+    let (status, headers, body) = http.call("GET", "/bucket/k", Body::empty()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(headers["x-amz-delete-marker"], "true");
+    assert!(body.contains("NoSuchKey"));
+    let (status, headers, _) = http
+        .call(
+            "HEAD",
+            &format!("/bucket/k?versionId={marker}"),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(headers.contains_key("last-modified"));
+    let (status, _, body) = http
+        .call(
+            "GET",
+            &format!("/bucket/k?versionId={}", "f".repeat(32)),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains("NoSuchVersion") && body.contains("<VersionId>"),
+        "{body}"
+    );
+
+    let (_, _, body) = http.call("GET", "/bucket?versions", Body::empty()).await;
+    assert!(body.contains("<ListVersionsResult"), "{body}");
+    assert_eq!(body.matches("<Version>").count(), 2);
+    assert_eq!(body.matches("<DeleteMarker>").count(), 1);
+    assert!(body.contains(&format!(
+        "<VersionId>{marker}</VersionId><IsLatest>true</IsLatest>"
+    )));
+
+    // Copy from a version; the source version is reported.
+    let req = Request::put("/bucket/restored")
+        .header("x-amz-copy-source", format!("/bucket/k?versionId={v1}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, _) = http.send(req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-amz-copy-source-version-id"], v1.as_str());
+    assert_eq!(
+        http.call("GET", "/bucket/restored", Body::empty()).await.2,
+        "v1"
+    );
+    let req = Request::put("/bucket/x")
+        .header("x-amz-copy-source", format!("/bucket/k?versionId={marker}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(http.send(req).await.0, StatusCode::BAD_REQUEST);
+
+    let delete = format!(
+        "<Delete><Object><Key>k</Key><VersionId>{marker}</VersionId></Object><Object><Key>restored</Key></Object></Delete>"
+    );
+    let (status, _, body) = http.call("POST", "/bucket?delete", delete).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&format!(
+            "<VersionId>{marker}</VersionId><DeleteMarker>true</DeleteMarker>"
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "<Key>restored</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>"
+        ),
+        "{body}"
+    );
+    assert_eq!(http.call("GET", "/bucket/k", Body::empty()).await.2, "v1");
+
+    let (_, _, body) = http
+        .call("GET", "/_ls2/browse/bucket?key=k", Body::empty())
+        .await;
+    assert!(
+        body.contains("<h2>Versions</h2>") && body.contains(&v1),
+        "{body}"
     );
 }
