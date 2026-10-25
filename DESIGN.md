@@ -19,9 +19,9 @@ HTTP からも Rust からも同じ検証を通ります。HTTP は `Mutex` で1
 
 ```text
 buckets(name, region, created_at_ms)
-buckets(..., versioning)                                                                  versioning: NULL / Enabled / Suspended
+buckets(..., versioning, tags JSON, cors JSON)                                            versioning: NULL / Enabled / Suspended
 objects(id, bucket, key BLOB, version_id, is_latest, delete_marker,
-        size, etag, last_modified_ms, metadata JSON, checksum JSON)                        UNIQUE(bucket, key, version_id)
+        size, etag, last_modified_ms, metadata JSON, checksum JSON, tags JSON)             UNIQUE(bucket, key, version_id)
 chunks(object_id, seq, offset, size, data BLOB)                                            PK(object_id, seq)
 uploads(id, bucket, key BLOB, initiated_at_ms, metadata JSON, checksum_algorithm)
 parts(upload_id, part_number, size, etag, last_modified_ms, checksum JSON, data BLOB)      PK(upload_id, part_number)
@@ -40,6 +40,12 @@ parts(upload_id, part_number, size, etag, last_modified_ms, checksum JSON, data 
 - 未設定・停止中の書き込みは `null` バージョンの行を置き換え、有効中は新しい行を追加します。
 - バージョン ID は32桁の16進数か `null` です。それ以外の形式は S3 と同じく `InvalidArgument` にします。
 - ストリーミング読み出しの途中でバージョンが削除・置き換えされたことは、行 id・ETag・更新時刻の比較で検出します。
+
+### タグと CORS
+
+タグはバージョンの行（オブジェクト）とバケットの行に JSON で持ちます。S3 と同じくタグの変更は ETag・更新時刻を変えないため、ダウンロード中にタグを変えても読み出しは続きます。マルチパートアップロードの `x-amz-tagging` はアップロードの行に保存し、完了時にオブジェクトへ移します。v2 → v3 は列の追加だけなので `ALTER TABLE ADD COLUMN` で移行します。
+
+CORS は S3 と同じくルールを先頭から評価します。preflight（`OPTIONS`）はバケット・オブジェクトのどちらのパスでも受け付け、許可リストの判定は行いません（ブラウザは presigned URL のクエリをそのまま付けて preflight を送るため）。実リクエストは `Origin` があり、オリジンとメソッドが一致するルールがあれば、成功・失敗にかかわらず `Access-Control-*` を付けます。
 
 ## 一覧
 
@@ -91,5 +97,5 @@ les のメール閲覧と同じく、サーバー側で HTML を組み立てま�
 
 ## 今後の拡張
 
-- **P3**: オブジェクト/バケットのタグ、CORS（ブラウザから直接アップロードする開発用）、ライフサイクルによる期限切れ削除（注入した時刻で決定的にテスト）、lqs へのイベント通知（S3 → SQS）。
+- **P3**: ライフサイクルによる期限切れ削除（注入した時刻で決定的にテスト）、lqs へのイベント通知（S3 → SQS）。
 - マルチパートの完成オブジェクトに FULL_OBJECT / COMPOSITE チェックサムを付けることも検討対象です。

@@ -417,6 +417,13 @@ fn object_details(
     for (name, value) in rows {
         table += &format!("<tr><th>{name}</th><td>{value}</td></tr>");
     }
+    for (k, v) in &o.tags {
+        table += &format!(
+            "<tr><th>Tag <code>{}</code></th><td><code>{}</code></td></tr>",
+            esc(k),
+            esc(v)
+        );
+    }
     for (k, v) in &m.user {
         table += &format!(
             "<tr><th><code>x-amz-meta-{}</code></th><td><code>{}</code></td></tr>",

@@ -1,12 +1,16 @@
 //! Local S3 core. Synchronous and SQLite-backed; callers supply Unix milliseconds.
 pub mod checksum;
+mod cors;
 mod multipart;
 mod schema;
 pub mod server;
+mod tagging;
 mod versions;
 
 pub use checksum::{Checksum, ChecksumAlgorithm, ChecksumInput};
+pub use cors::{CorsRule, MAX_CORS_RULES, find_cors_rule};
 pub use multipart::{CompletedPart, PartInfo, UploadInfo};
+pub use tagging::{MAX_BUCKET_TAGS, MAX_OBJECT_TAGS, Tags, tags_from_pairs};
 pub use versions::{VersionEntry, VersionListRequest, VersionListResult};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -41,6 +45,7 @@ pub enum Error {
     InvalidBucketName,
     KeyTooLong,
     MetadataTooLarge,
+    InvalidTag(String),
     InvalidArgument(String),
     InvalidRequest(String),
     InvalidRange,
@@ -73,6 +78,7 @@ impl Error {
             Self::InvalidBucketName => "InvalidBucketName",
             Self::KeyTooLong => "KeyTooLongError",
             Self::MetadataTooLarge => "MetadataTooLarge",
+            Self::InvalidTag(_) => "InvalidTag",
             Self::InvalidArgument(_) => "InvalidArgument",
             Self::InvalidRequest(_) => "InvalidRequest",
             Self::InvalidRange => "InvalidRange",
@@ -124,6 +130,7 @@ impl std::fmt::Display for Error {
             }
             Self::NotModified => "Not Modified",
             Self::InvalidArgument(s)
+            | Self::InvalidTag(s)
             | Self::InvalidRequest(s)
             | Self::InvalidPart(s)
             | Self::BadDigest(s)
@@ -210,6 +217,7 @@ pub struct ObjectInfo {
     pub checksum: Option<Checksum>,
     /// [`NULL_VERSION`] unless written while versioning was enabled.
     pub version_id: String,
+    pub tags: Tags,
 }
 
 /// Result of deleting a key or a version.
@@ -236,6 +244,13 @@ pub struct CopySource {
     pub version_id: Option<String>,
     /// `x-amz-copy-source-if-*`; every failure is PreconditionFailed.
     pub condition: ReadCondition,
+}
+
+/// Directives of CopyObject; `None` copies the source value (the COPY directive).
+#[derive(Debug, Clone, Default)]
+pub struct CopyOptions {
+    pub metadata: Option<Metadata>,
+    pub tags: Option<Tags>,
 }
 
 /// Conditions for writes (`If-Match` / `If-None-Match: *`).
@@ -304,6 +319,7 @@ impl ByteRange {
 #[derive(Debug, Clone, Default)]
 pub struct PutOptions {
     pub metadata: Metadata,
+    pub tags: Tags,
     pub checksum: ChecksumInput,
     pub content_md5: Option<[u8; 16]>,
     pub condition: WriteCondition,
@@ -532,6 +548,7 @@ impl Ls2 {
             metadata: opts.metadata,
             checksum,
             version_id: new_version_id(versioning),
+            tags: opts.tags,
         };
         check_write_condition(&tx, bucket, key, &opts.condition)?;
         let id = write_version(&tx, &info, versioning)?;
@@ -667,10 +684,11 @@ impl Ls2 {
         source: &CopySource,
         dst_bucket: &str,
         dst_key: &str,
-        metadata: Option<Metadata>,
+        options: CopyOptions,
         now_ms: i64,
     ) -> Result<(ObjectInfo, String), Error> {
         validate_key(dst_key)?;
+        let CopyOptions { metadata, tags } = options;
         if let Some(m) = &metadata {
             m.validate()?;
         }
@@ -694,6 +712,7 @@ impl Ls2 {
             last_modified_ms: now_ms,
             metadata: metadata.unwrap_or_else(|| src.metadata.clone()),
             version_id: new_version_id(versioning),
+            tags: tags.unwrap_or_else(|| src.tags.clone()),
             ..src.clone()
         };
         let replaces_source = source.bucket == dst_bucket
@@ -703,8 +722,13 @@ impl Ls2 {
         if replaces_source {
             // The new `null` version would replace its own source: update it in place.
             tx.execute(
-                "UPDATE objects SET metadata=?2, last_modified_ms=?3 WHERE id=?1",
-                params![src_id, to_json(&info.metadata), now_ms],
+                "UPDATE objects SET metadata=?2, last_modified_ms=?3, tags=?4 WHERE id=?1",
+                params![
+                    src_id,
+                    to_json(&info.metadata),
+                    now_ms,
+                    tagging::tags_json(&info.tags)
+                ],
             )?;
         } else {
             let id = write_version(&tx, &info, versioning)?;
@@ -814,7 +838,7 @@ pub(crate) fn key_string(bytes: Vec<u8>, col: usize) -> rusqlite::Result<String>
     })
 }
 
-pub(crate) const OBJECT_COLUMNS: &str = "id, key, size, etag, last_modified_ms, metadata, checksum, version_id, is_latest, delete_marker";
+pub(crate) const OBJECT_COLUMNS: &str = "id, key, size, etag, last_modified_ms, metadata, checksum, version_id, is_latest, delete_marker, tags";
 
 /// One stored version (object or delete marker).
 pub(crate) struct Row {
@@ -837,6 +861,7 @@ pub(crate) fn decode_row(r: &rusqlite::Row<'_>, bucket: &str) -> rusqlite::Resul
             metadata: from_json(&r.get::<_, String>(5)?, 5)?,
             checksum: checksum.map(|c| from_json(&c, 6)).transpose()?,
             version_id: r.get(7)?,
+            tags: tagging::decode_tags(r.get(10)?, 10)?,
         },
         is_latest: r.get(8)?,
         delete_marker: r.get(9)?,
@@ -1036,8 +1061,8 @@ fn insert_row(
     }
     conn.execute(
         "INSERT INTO objects(bucket, key, version_id, is_latest, delete_marker,
-                             size, etag, last_modified_ms, metadata, checksum)
-         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9)",
+                             size, etag, last_modified_ms, metadata, checksum, tags)
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             info.bucket,
             info.key.as_bytes(),
@@ -1048,6 +1073,7 @@ fn insert_row(
             info.last_modified_ms,
             to_json(&info.metadata),
             info.checksum.as_ref().map(to_json),
+            tagging::tags_json(&info.tags),
         ],
     )?;
     let id = conn.last_insert_rowid();
@@ -1096,6 +1122,7 @@ fn delete_in(
         metadata: Metadata::default(),
         checksum: None,
         version_id: new_version_id(versioning),
+        tags: Tags::new(),
     };
     insert_row(conn, &marker, true, versioning)?;
     Ok(DeleteOutcome {

@@ -3,7 +3,7 @@ use crate::Error;
 use rusqlite::Connection;
 
 /// Version written by this build. Newer databases are refused.
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 /// Latest schema, used for new databases.
 const CREATE: &str = "
@@ -11,7 +11,9 @@ CREATE TABLE buckets (
     name TEXT PRIMARY KEY,
     region TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL,
-    versioning TEXT);
+    versioning TEXT,
+    tags TEXT,
+    cors TEXT);
 CREATE TABLE objects (
     id INTEGER PRIMARY KEY,
     bucket TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
@@ -24,6 +26,7 @@ CREATE TABLE objects (
     last_modified_ms INTEGER NOT NULL,
     metadata TEXT NOT NULL,
     checksum TEXT,
+    tags TEXT,
     UNIQUE (bucket, key, version_id));
 CREATE INDEX objects_versions ON objects (bucket, key, id);
 CREATE INDEX objects_current ON objects (bucket, key) WHERE is_latest = 1 AND delete_marker = 0;
@@ -40,7 +43,8 @@ CREATE TABLE uploads (
     key BLOB NOT NULL,
     initiated_at_ms INTEGER NOT NULL,
     metadata TEXT NOT NULL,
-    checksum_algorithm TEXT);
+    checksum_algorithm TEXT,
+    tags TEXT);
 CREATE INDEX uploads_by_key ON uploads (bucket, key, initiated_at_ms, id);
 CREATE TABLE parts (
     upload_id TEXT NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
@@ -81,8 +85,16 @@ CREATE INDEX objects_versions ON objects (bucket, key, id);
 CREATE INDEX objects_current ON objects (bucket, key) WHERE is_latest = 1 AND delete_marker = 0;
 ";
 
+/// 2 → 3: object, upload and bucket tags; bucket CORS configuration.
+const V3: &str = "
+ALTER TABLE objects ADD COLUMN tags TEXT;
+ALTER TABLE uploads ADD COLUMN tags TEXT;
+ALTER TABLE buckets ADD COLUMN tags TEXT;
+ALTER TABLE buckets ADD COLUMN cors TEXT;
+";
+
 /// `(target version, SQL)` applied in order to reach [`SCHEMA_VERSION`].
-const MIGRATIONS: &[(i64, &str)] = &[(2, V2)];
+const MIGRATIONS: &[(i64, &str)] = &[(2, V2), (3, V3)];
 
 pub(crate) fn init(conn: &mut Connection) -> Result<(), Error> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;

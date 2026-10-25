@@ -280,3 +280,103 @@ func TestVersioning(t *testing.T) {
 		t.Fatalf("DeleteBucket: %v", err)
 	}
 }
+
+func TestTaggingAndCORS(t *testing.T) {
+	client := newClient(t, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	bucket := fmt.Sprintf("ls2-go-tag-%d", time.Now().UnixNano())
+	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("CreateBucket: %v", err)
+	}
+	if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"), Body: strings.NewReader("x"),
+		Tagging: aws.String("env=dev&team=s3"),
+	}); err != nil {
+		t.Fatalf("PutObject(tagging): %v", err)
+	}
+	head, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("k")})
+	if err != nil || aws.ToInt32(head.TagCount) != 2 {
+		t.Fatalf("GetObject TagCount = %v, %v", head.TagCount, err)
+	}
+	head.Body.Close()
+	if _, err := client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
+		Bucket: aws.String(bucket), Key: aws.String("k"),
+		Tagging: &types.Tagging{TagSet: []types.Tag{{Key: aws.String("only"), Value: aws.String("one")}}},
+	}); err != nil {
+		t.Fatalf("PutObjectTagging: %v", err)
+	}
+	tagging, err := client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{Bucket: aws.String(bucket), Key: aws.String("k")})
+	if err != nil || len(tagging.TagSet) != 1 || aws.ToString(tagging.TagSet[0].Key) != "only" {
+		t.Fatalf("GetObjectTagging = %+v, %v", tagging, err)
+	}
+	if _, err := client.PutBucketTagging(ctx, &s3.PutBucketTaggingInput{
+		Bucket:  aws.String(bucket),
+		Tagging: &types.Tagging{TagSet: []types.Tag{{Key: aws.String("cost"), Value: aws.String("dev")}}},
+	}); err != nil {
+		t.Fatalf("PutBucketTagging: %v", err)
+	}
+	bucketTags, err := client.GetBucketTagging(ctx, &s3.GetBucketTaggingInput{Bucket: aws.String(bucket)})
+	if err != nil || len(bucketTags.TagSet) != 1 {
+		t.Fatalf("GetBucketTagging = %+v, %v", bucketTags, err)
+	}
+
+	if _, err := client.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+		Bucket: aws.String(bucket),
+		CORSConfiguration: &types.CORSConfiguration{CORSRules: []types.CORSRule{{
+			AllowedOrigins: []string{"http://localhost:3000"},
+			AllowedMethods: []string{"GET", "PUT"},
+			AllowedHeaders: []string{"*"},
+			ExposeHeaders:  []string{"ETag"},
+			MaxAgeSeconds:  aws.Int32(600),
+		}}},
+	}); err != nil {
+		t.Fatalf("PutBucketCors: %v", err)
+	}
+	cors, err := client.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: aws.String(bucket)})
+	if err != nil || len(cors.CORSRules) != 1 || aws.ToInt32(cors.CORSRules[0].MaxAgeSeconds) != 600 {
+		t.Fatalf("GetBucketCors = %+v, %v", cors, err)
+	}
+
+	// Browser preflight for a presigned PUT.
+	presigned, err := s3.NewPresignClient(client).PresignPutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String("upload.txt"),
+	})
+	if err != nil {
+		t.Fatalf("PresignPutObject: %v", err)
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodOptions, presigned.URL, nil)
+	req.Header.Set("Origin", "http://localhost:3000")
+	req.Header.Set("Access-Control-Request-Method", "PUT")
+	req.Header.Set("Access-Control-Request-Headers", "content-type")
+	res, err := httpClient().Do(req)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK || res.Header.Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
+		t.Fatalf("preflight = %d %v", res.StatusCode, res.Header)
+	}
+	put, _ := http.NewRequestWithContext(ctx, http.MethodPut, presigned.URL, strings.NewReader("from browser"))
+	put.Header.Set("Origin", "http://localhost:3000")
+	res, err = httpClient().Do(put)
+	if err != nil {
+		t.Fatalf("presigned PUT: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK || res.Header.Get("Access-Control-Expose-Headers") != "ETag" {
+		t.Fatalf("presigned PUT = %d %v", res.StatusCode, res.Header)
+	}
+
+	for _, k := range []string{"k", "upload.txt"} {
+		if _, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(k)}); err != nil {
+			t.Fatalf("DeleteObject(%s): %v", k, err)
+		}
+	}
+	if _, err := client.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("DeleteBucketCors: %v", err)
+	}
+	if _, err := client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("DeleteBucket: %v", err)
+	}
+}

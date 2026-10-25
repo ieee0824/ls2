@@ -2,8 +2,8 @@
 use crate::checksum::{self, Checksum, ChecksumAlgorithm, ChecksumInput};
 use crate::{
     ByteRange, CopySource, Error, Ls2, MAX_LIST, MAX_PART_NUMBER, MIN_PART_SIZE, Metadata,
-    ObjectInfo, WriteCondition, bucket_versioning, check_write_condition, from_json, key_string,
-    new_version_id, require_bucket, to_json, validate_key, write_version,
+    ObjectInfo, Tags, WriteCondition, bucket_versioning, check_write_condition, from_json,
+    key_string, new_version_id, require_bucket, to_json, validate_key, write_version,
 };
 use md5::{Digest, Md5};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -17,6 +17,8 @@ pub struct UploadInfo {
     pub initiated_at_ms: i64,
     pub metadata: Metadata,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// Applied to the object on completion (`x-amz-tagging` of CreateMultipartUpload).
+    pub tags: Tags,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -46,10 +48,11 @@ fn decode_upload(r: &rusqlite::Row<'_>) -> rusqlite::Result<UploadInfo> {
         initiated_at_ms: r.get(3)?,
         metadata: from_json(&r.get::<_, String>(4)?, 4)?,
         checksum_algorithm: algorithm.as_deref().and_then(ChecksumAlgorithm::parse),
+        tags: crate::tagging::decode_tags(r.get(6)?, 6)?,
     })
 }
 
-const UPLOAD_COLUMNS: &str = "id, bucket, key, initiated_at_ms, metadata, checksum_algorithm";
+const UPLOAD_COLUMNS: &str = "id, bucket, key, initiated_at_ms, metadata, checksum_algorithm, tags";
 
 /// The upload must belong to the bucket and key named in the request.
 fn load_upload(
@@ -85,6 +88,7 @@ impl Ls2 {
         bucket: &str,
         key: &str,
         metadata: Metadata,
+        tags: Tags,
         checksum_algorithm: Option<ChecksumAlgorithm>,
         now_ms: i64,
     ) -> Result<String, Error> {
@@ -94,15 +98,16 @@ impl Ls2 {
         let tx = self.write_tx()?;
         require_bucket(&tx, bucket)?;
         tx.execute(
-            "INSERT INTO uploads(id, bucket, key, initiated_at_ms, metadata, checksum_algorithm)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO uploads(id, bucket, key, initiated_at_ms, metadata, checksum_algorithm, tags)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id,
                 bucket,
                 key.as_bytes(),
                 now_ms,
                 to_json(&metadata),
-                checksum_algorithm.map(ChecksumAlgorithm::name)
+                checksum_algorithm.map(ChecksumAlgorithm::name),
+                crate::tagging::tags_json(&tags)
             ],
         )?;
         tx.commit()?;
@@ -278,6 +283,7 @@ impl Ls2 {
             metadata: upload.metadata,
             checksum: None,
             version_id: new_version_id(versioning),
+            tags: upload.tags,
         };
         let id = write_version(&tx, &info, versioning)?;
         let mut offset = 0u64;

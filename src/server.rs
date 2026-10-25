@@ -3,9 +3,10 @@ mod browse;
 
 use crate::checksum::{Checksum, ChecksumAlgorithm, ChecksumInput};
 use crate::{
-    ByteRange, CompletedPart, CopySource, DeleteOutcome, Error, ListRequest, Ls2, MAX_LIST,
-    Metadata, ObjectHandle, ObjectId, ObjectInfo, PutOptions, ReadCondition, VersionListRequest,
-    Versioning, WriteCondition,
+    ByteRange, CompletedPart, CopyOptions, CopySource, CorsRule, DeleteOutcome, Error, ListRequest,
+    Ls2, MAX_BUCKET_TAGS, MAX_LIST, MAX_OBJECT_TAGS, Metadata, ObjectHandle, ObjectId, ObjectInfo,
+    PutOptions, ReadCondition, Tags, VersionListRequest, Versioning, WriteCondition,
+    find_cors_rule, tags_from_pairs,
 };
 use axum::{
     Router,
@@ -601,6 +602,15 @@ impl Req<'_> {
     fn version_id(&self) -> Option<&str> {
         self.query("versionId")
     }
+    /// `x-amz-tagging: k1=v1&k2=v2` (URL query encoding).
+    fn tagging_header(&self) -> Result<Tags, S3Error> {
+        let Some(raw) = self.header("x-amz-tagging") else {
+            return Ok(Tags::new());
+        };
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw)
+            .map_err(|_| invalid_argument("The header 'x-amz-tagging' shall be encoded as UTF-8 then URLEncoded URL query parameters without tag name duplicates."))?;
+        Ok(tags_from_pairs(pairs, MAX_OBJECT_TAGS)?)
+    }
 }
 
 fn parse_target(uri: &Uri, host_bucket: Option<String>) -> Result<Target, S3Error> {
@@ -889,6 +899,20 @@ async fn handle(
         Ok(r) => r,
         Err(e) => error_response(e, target.as_ref().ok(), &request_id, head),
     };
+    if method != Method::OPTIONS
+        && let (
+            Some(origin),
+            Ok(Target {
+                bucket: Some(bucket),
+                ..
+            }),
+        ) = (
+            headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
+            &target,
+        )
+    {
+        apply_cors(&state, bucket, &method, origin, &mut response);
+    }
     let h = response.headers_mut();
     h.insert(
         "x-amz-request-id",
@@ -910,6 +934,7 @@ fn dispatch(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Error
             "MethodNotAllowed",
             "The specified method is not allowed against this resource.",
         )),
+        (Some(_), _) if method == Method::OPTIONS => preflight(ls2, r),
         (Some(_), None) => bucket_op(ls2, method, r),
         (Some(_), Some(_)) => object_op(ls2, method, r),
     }
@@ -971,6 +996,54 @@ fn bucket_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Erro
             Ok(StatusCode::OK.into_response())
         }
         Method::GET if r.has("versions") => list_versions(ls2, r),
+        Method::GET if r.has("tagging") => {
+            r.allow(&["tagging"], &[], false)?;
+            let tags = ls2.get_bucket_tagging(bucket)?.ok_or_else(|| {
+                s3err(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchTagSet",
+                    "The TagSet does not exist",
+                )
+            })?;
+            Ok(xml_response(xml_doc("Tagging", &tags_xml(&tags))))
+        }
+        Method::PUT if r.has("tagging") => {
+            r.allow(&["tagging"], &[], false)?;
+            r.payload.verify()?;
+            let tags = parse_tagging(&r.payload.data, MAX_BUCKET_TAGS)?;
+            ls2.put_bucket_tagging(bucket, tags)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        Method::DELETE if r.has("tagging") => {
+            r.allow(&["tagging"], &[], false)?;
+            ls2.delete_bucket_tagging(bucket)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        Method::GET if r.has("cors") => {
+            r.allow(&["cors"], &[], false)?;
+            let rules = ls2.get_bucket_cors(bucket)?.ok_or_else(|| {
+                s3err(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchCORSConfiguration",
+                    "The CORS configuration does not exist",
+                )
+            })?;
+            Ok(xml_response(xml_doc(
+                "CORSConfiguration",
+                &cors_xml(&rules),
+            )))
+        }
+        Method::PUT if r.has("cors") => {
+            r.allow(&["cors"], &[], false)?;
+            r.payload.verify()?;
+            ls2.put_bucket_cors(bucket, parse_cors(&r.payload.data)?)?;
+            Ok(StatusCode::OK.into_response())
+        }
+        Method::DELETE if r.has("cors") => {
+            r.allow(&["cors"], &[], false)?;
+            ls2.delete_bucket_cors(bucket)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
         Method::GET if r.has("uploads") => list_uploads(ls2, r),
         Method::GET if r.has("list-type") => list_objects_v2(ls2, r),
         Method::GET => list_objects_v1(ls2, r),
@@ -1009,6 +1082,34 @@ fn bucket_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Erro
 
 fn object_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Error> {
     match *method {
+        Method::PUT if r.has("tagging") => {
+            r.allow(&["tagging", "versionId"], &[], false)?;
+            r.payload.verify()?;
+            let tags = parse_tagging(&r.payload.data, MAX_OBJECT_TAGS)?;
+            let version = ls2.put_object_tagging(r.bucket(), r.key(), r.version_id(), tags)?;
+            let mut response = StatusCode::OK.into_response();
+            version_header(
+                ls2,
+                response.headers_mut(),
+                r.bucket(),
+                "x-amz-version-id",
+                &version,
+            )?;
+            Ok(response)
+        }
+        Method::DELETE if r.has("tagging") => {
+            r.allow(&["tagging", "versionId"], &[], false)?;
+            let version = ls2.delete_object_tagging(r.bucket(), r.key(), r.version_id())?;
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            version_header(
+                ls2,
+                response.headers_mut(),
+                r.bucket(),
+                "x-amz-version-id",
+                &version,
+            )?;
+            Ok(response)
+        }
         Method::PUT if r.has("uploadId") || r.has("partNumber") => {
             if r.headers.contains_key("x-amz-copy-source") {
                 upload_part_copy(ls2, r)
@@ -1021,8 +1122,16 @@ fn object_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Erro
         Method::GET if r.has("uploadId") => list_parts(ls2, r),
         Method::GET if r.has("tagging") => {
             r.allow(&["tagging", "versionId"], &[], false)?;
-            ls2.head_object(r.bucket(), r.key(), r.version_id())?;
-            Ok(xml_response(xml_doc("Tagging", "<TagSet></TagSet>")))
+            let (version, tags) = ls2.get_object_tagging(r.bucket(), r.key(), r.version_id())?;
+            let mut response = xml_response(xml_doc("Tagging", &tags_xml(&tags)));
+            version_header(
+                ls2,
+                response.headers_mut(),
+                r.bucket(),
+                "x-amz-version-id",
+                &version,
+            )?;
+            Ok(response)
         }
         Method::GET | Method::HEAD => get_object(ls2, r, *method == Method::HEAD),
         Method::DELETE if r.has("uploadId") => {
@@ -1479,13 +1588,18 @@ fn checksum_headers(h: &mut HeaderMap, checksum: Option<&Checksum>) -> Result<()
 }
 
 fn put_object(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
-    r.allow(&[], &["x-amz-storage-class", "x-amz-acl"], true)?;
+    r.allow(
+        &[],
+        &["x-amz-storage-class", "x-amz-acl", "x-amz-tagging"],
+        true,
+    )?;
     let info = ls2.put_object(
         r.bucket(),
         r.key(),
         &r.payload.data,
         PutOptions {
             metadata: r.metadata()?,
+            tags: r.tagging_header()?,
             checksum: r.payload.checksum.clone(),
             content_md5: r.payload.content_md5,
             condition: r.write_condition()?,
@@ -1573,6 +1687,9 @@ fn get_object(ls2: &mut Ls2, r: &Req, head: bool) -> Result<Response, S3Error> {
     }
     h.insert("x-amz-storage-class", HeaderValue::from_static("STANDARD"));
     version_header(ls2, h, r.bucket(), "x-amz-version-id", &info.version_id)?;
+    if !info.tags.is_empty() {
+        h.insert("x-amz-tagging-count", HeaderValue::from(info.tags.len()));
+    }
     if let Some(parts) = info.etag.split_once('-').map(|(_, n)| n) {
         h.insert("x-amz-mp-parts-count", header_value(parts)?);
     }
@@ -1610,19 +1727,31 @@ fn copy_object(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
             "x-amz-copy-source-if-modified-since",
             "x-amz-copy-source-if-unmodified-since",
             "x-amz-metadata-directive",
+            "x-amz-tagging",
+            "x-amz-tagging-directive",
             "x-amz-storage-class",
             "x-amz-acl",
         ],
         true,
     )?;
     let source = r.copy_source()?;
+    let tags = match r.header("x-amz-tagging-directive") {
+        None | Some("COPY") => None,
+        Some("REPLACE") => Some(r.tagging_header()?),
+        Some(_) => return Err(invalid_argument("Unknown tagging directive.")),
+    };
     let metadata = match r.header("x-amz-metadata-directive") {
         None | Some("COPY") => None,
         Some("REPLACE") => Some(r.metadata()?),
         Some(_) => return Err(invalid_argument("Unknown metadata directive.")),
     };
-    let (info, source_version) =
-        ls2.copy_object(&source, r.bucket(), r.key(), metadata, r.now_ms)?;
+    let (info, source_version) = ls2.copy_object(
+        &source,
+        r.bucket(),
+        r.key(),
+        CopyOptions { metadata, tags },
+        r.now_ms,
+    )?;
     let checksum = info
         .checksum
         .as_ref()
@@ -1657,6 +1786,7 @@ fn create_upload(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
             "x-amz-acl",
             "x-amz-checksum-algorithm",
             "x-amz-checksum-type",
+            "x-amz-tagging",
         ],
         true,
     )?;
@@ -1674,8 +1804,14 @@ fn create_upload(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
             "Value for x-amz-checksum-type header is invalid.",
         ));
     }
-    let id =
-        ls2.create_multipart_upload(r.bucket(), r.key(), r.metadata()?, algorithm, r.now_ms)?;
+    let id = ls2.create_multipart_upload(
+        r.bucket(),
+        r.key(),
+        r.metadata()?,
+        r.tagging_header()?,
+        algorithm,
+        r.now_ms,
+    )?;
     let body = xml_doc(
         "InitiateMultipartUploadResult",
         &(tag("Bucket", r.bucket()) + &tag("Key", r.key()) + &tag("UploadId", &id)),
@@ -1915,4 +2051,205 @@ fn list_parts(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
         );
     }
     Ok(xml_response(xml_doc("ListPartsResult", &inner)))
+}
+
+// ---- tagging ----
+
+fn tags_xml(tags: &Tags) -> String {
+    let mut out = String::from("<TagSet>");
+    for (k, v) in tags {
+        out += &format!("<Tag>{}{}</Tag>", tag("Key", k), tag("Value", v));
+    }
+    out + "</TagSet>"
+}
+
+fn parse_tagging(body: &[u8], max: usize) -> Result<Tags, S3Error> {
+    #[derive(Deserialize)]
+    struct Tagging {
+        #[serde(rename = "TagSet")]
+        tag_set: TagSet,
+    }
+    #[derive(Deserialize)]
+    struct TagSet {
+        #[serde(rename = "Tag", default)]
+        tags: Vec<Tag>,
+    }
+    #[derive(Deserialize)]
+    struct Tag {
+        #[serde(rename = "Key")]
+        key: String,
+        #[serde(rename = "Value")]
+        value: Option<String>,
+    }
+    let tagging: Tagging = quick_xml::de::from_reader(body).map_err(|_| malformed_xml())?;
+    let pairs = tagging
+        .tag_set
+        .tags
+        .into_iter()
+        .map(|t| (t.key, t.value.unwrap_or_default()));
+    Ok(tags_from_pairs(pairs, max)?)
+}
+
+// ---- CORS ----
+
+fn cors_xml(rules: &[CorsRule]) -> String {
+    let mut out = String::new();
+    for rule in rules {
+        out += "<CORSRule>";
+        if let Some(id) = &rule.id {
+            out += &tag("ID", id);
+        }
+        for (name, values) in [
+            ("AllowedHeader", &rule.allowed_headers),
+            ("AllowedMethod", &rule.allowed_methods),
+            ("AllowedOrigin", &rule.allowed_origins),
+            ("ExposeHeader", &rule.expose_headers),
+        ] {
+            for v in values {
+                out += &tag(name, v);
+            }
+        }
+        if let Some(age) = rule.max_age_seconds {
+            out += &format!("<MaxAgeSeconds>{age}</MaxAgeSeconds>");
+        }
+        out += "</CORSRule>";
+    }
+    out
+}
+
+fn parse_cors(body: &[u8]) -> Result<Vec<CorsRule>, S3Error> {
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(rename = "CORSRule", default)]
+        rules: Vec<Rule>,
+    }
+    #[derive(Deserialize)]
+    struct Rule {
+        #[serde(rename = "ID")]
+        id: Option<String>,
+        #[serde(rename = "AllowedOrigin", default)]
+        origins: Vec<String>,
+        #[serde(rename = "AllowedMethod", default)]
+        methods: Vec<String>,
+        #[serde(rename = "AllowedHeader", default)]
+        headers: Vec<String>,
+        #[serde(rename = "ExposeHeader", default)]
+        expose: Vec<String>,
+        #[serde(rename = "MaxAgeSeconds")]
+        max_age: Option<u32>,
+    }
+    let config: Config = quick_xml::de::from_reader(body).map_err(|_| malformed_xml())?;
+    Ok(config
+        .rules
+        .into_iter()
+        .map(|r| CorsRule {
+            id: r.id,
+            allowed_origins: r.origins,
+            allowed_methods: r.methods,
+            allowed_headers: r.headers,
+            expose_headers: r.expose,
+            max_age_seconds: r.max_age,
+        })
+        .collect())
+}
+
+/// `Access-Control-*` headers for a request the rule allows.
+fn cors_headers(h: &mut HeaderMap, rule: &CorsRule, origin: &str) -> Result<(), S3Error> {
+    let any = rule.allowed_origins.iter().any(|o| o == "*");
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header_value(if any { "*" } else { origin })?,
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        header_value(&rule.allowed_methods.join(", "))?,
+    );
+    if !any {
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
+    if !rule.expose_headers.is_empty() {
+        h.insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            header_value(&rule.expose_headers.join(", "))?,
+        );
+    }
+    if let Some(age) = rule.max_age_seconds {
+        h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from(age));
+    }
+    Ok(())
+}
+
+fn forbidden_cors(message: &str) -> S3Error {
+    s3err(
+        StatusCode::FORBIDDEN,
+        "AccessForbidden",
+        format!("CORSResponse: {message}"),
+    )
+}
+
+/// OPTIONS preflight against the bucket's CORS rules.
+fn preflight(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
+    let origin = r.header("origin").ok_or_else(|| {
+        bad(
+            "BadRequest",
+            "Insufficient information. Origin request header needed.",
+        )
+    })?;
+    let method = r
+        .header("access-control-request-method")
+        .ok_or_else(|| bad("BadRequest", "Invalid Access-Control-Request-Method: null"))?;
+    let requested: Vec<String> = r
+        .header("access-control-request-headers")
+        .map(|v| {
+            v.split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let rules = ls2
+        .get_bucket_cors(r.bucket())?
+        .ok_or_else(|| forbidden_cors("CORS is not enabled for this bucket."))?;
+    let rule = find_cors_rule(&rules, origin, method, &requested).ok_or_else(|| {
+        forbidden_cors("This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec.")
+    })?;
+    let mut response = StatusCode::OK.into_response();
+    let h = response.headers_mut();
+    cors_headers(h, rule, origin)?;
+    if !requested.is_empty() {
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            header_value(&requested.join(", "))?,
+        );
+    }
+    h.insert(
+        header::VARY,
+        HeaderValue::from_static(
+            "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        ),
+    );
+    Ok(response)
+}
+
+/// CORS headers on an actual (non-preflight) request from a browser.
+fn apply_cors(
+    state: &Shared,
+    bucket: &str,
+    method: &Method,
+    origin: &str,
+    response: &mut Response,
+) {
+    let Ok(ls2) = lock(state) else { return };
+    let Ok(Some(rules)) = ls2.get_bucket_cors(bucket) else {
+        return;
+    };
+    if let Some(rule) = find_cors_rule(&rules, origin, method.as_str(), &[]) {
+        let h = response.headers_mut();
+        if cors_headers(h, rule, origin).is_ok() {
+            h.insert(header::VARY, HeaderValue::from_static("Origin"));
+        }
+    }
 }
