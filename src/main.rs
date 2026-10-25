@@ -33,8 +33,15 @@ async fn main() {
             eprintln!("cannot bind {addr}: {e}");
             std::process::exit(1);
         });
+    let config = ls2::server::Config {
+        virtual_host_domains: env("LS2_VIRTUAL_HOST_DOMAINS", "localhost")
+            .split(',')
+            .map(str::to_owned)
+            .collect(),
+    };
     eprintln!("ls2 listening on http://{addr} (database: {path})");
-    axum::serve(listener, ls2::server::router(ls2))
+    eprintln!("browse: http://{addr}/_ls2/browse");
+    axum::serve(listener, ls2::server::router_with_config(ls2, config))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

@@ -1,16 +1,17 @@
-//! S3 REST/XML adapter (path-style addressing). SigV4 is accepted but not verified.
+//! S3 REST/XML adapter (path-style and virtual-hosted style). SigV4 is accepted but not verified.
+mod browse;
+
 use crate::checksum::{Checksum, ChecksumAlgorithm, ChecksumInput};
 use crate::{
-    ByteRange, CompletedPart, Error, ListRequest, Ls2, MAX_LIST, Metadata, ObjectInfo, PutOptions,
-    ReadCondition, WriteCondition,
+    ByteRange, CompletedPart, Error, ListRequest, Ls2, MAX_LIST, Metadata, ObjectHandle,
+    ObjectInfo, PutOptions, ReadCondition, WriteCondition,
 };
 use axum::{
-    Json, Router,
+    Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::get,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
@@ -32,15 +33,50 @@ const OWNER_NAME: &str = "ls2";
 const NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const MAX_DELETE_OBJECTS: usize = 1000;
 
-type Shared = Arc<Mutex<Ls2>>;
+/// GET bodies larger than this are streamed in pieces of this size.
+const READ_PIECE: usize = 1024 * 1024;
+
+/// HTTP adapter settings.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Hosts of the form `<bucket>.<domain>` are virtual-hosted style requests.
+    /// Any other host (an IP address, `localhost`, a container name) uses path-style.
+    pub virtual_host_domains: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            virtual_host_domains: vec!["localhost".into()],
+        }
+    }
+}
+
+struct AppState {
+    ls2: Mutex<Ls2>,
+    domains: Vec<String>,
+}
+
+type Shared = Arc<AppState>;
 
 pub fn router(ls2: Ls2) -> Router {
+    router_with_config(ls2, Config::default())
+}
+
+pub fn router_with_config(ls2: Ls2, config: Config) -> Router {
+    let domains = config
+        .virtual_host_domains
+        .iter()
+        .map(|d| d.trim().trim_matches('.').to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
     Router::new()
-        .route("/_ls2/health", get(|| async { "ok" }))
-        .route("/_ls2/status", get(status))
         .fallback(handle)
         .layer(DefaultBodyLimit::disable())
-        .with_state(Arc::new(Mutex::new(ls2)))
+        .with_state(Arc::new(AppState {
+            ls2: Mutex::new(ls2),
+            domains,
+        }))
 }
 
 fn now() -> i64 {
@@ -52,15 +88,58 @@ fn now() -> i64 {
 
 fn lock(state: &Shared) -> Result<std::sync::MutexGuard<'_, Ls2>, S3Error> {
     state
+        .ls2
         .lock()
         .map_err(|_| Error::Storage(rusqlite::Error::InvalidQuery).into())
 }
 
-async fn status(State(state): State<Shared>) -> Response {
-    match lock(&state).and_then(|s| s.stats().map_err(S3Error::from)) {
-        Ok(buckets) => Json(serde_json::json!({ "buckets": buckets })).into_response(),
-        Err(e) => (e.status, e.message).into_response(),
+/// The bucket named by a `<bucket>.<domain>` Host header, if any.
+fn virtual_host_bucket(domains: &[String], host: &str) -> Option<String> {
+    let host = host.to_ascii_lowercase();
+    // Strip the port (IPv6 literals are never virtual hosts).
+    let name = match host.rsplit_once(':') {
+        Some((h, port)) if !h.contains(':') && port.bytes().all(|c| c.is_ascii_digit()) => h,
+        _ => host.as_str(),
+    };
+    let name = name.trim_end_matches('.');
+    domains.iter().find_map(|d| {
+        name.strip_suffix(d.as_str())
+            .and_then(|rest| rest.strip_suffix('.'))
+            .filter(|b| !b.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Response body for `handle`: the first piece is read now (under the caller's lock),
+/// the rest is streamed piece by piece, taking the lock for each read.
+fn object_body(ls2: &Ls2, state: &Shared, handle: ObjectHandle) -> Result<Body, S3Error> {
+    let first_len = ((handle.end - handle.start) as usize).min(READ_PIECE);
+    let first = ls2.read_object(&handle, handle.start, first_len)?;
+    let next = handle.start + first.len() as u64;
+    if next >= handle.end {
+        return Ok(Body::from(first));
     }
+    let state = state.clone();
+    let handle = Arc::new(handle);
+    let rest = futures_util::stream::unfold(next, move |pos| {
+        let (state, handle) = (state.clone(), handle.clone());
+        async move {
+            if pos >= handle.end {
+                return None;
+            }
+            let len = ((handle.end - pos) as usize).min(READ_PIECE);
+            let piece = lock(&state).and_then(|s| Ok(s.read_object(&handle, pos, len)?));
+            Some(match piece {
+                Ok(data) => (Ok(Bytes::from(data)), pos + len as u64),
+                // Ends the stream; the client sees a short body and retries.
+                Err(e) => (Err(std::io::Error::other(e.message)), handle.end),
+            })
+        }
+    });
+    let first = futures_util::stream::once(async move { Ok(Bytes::from(first)) });
+    Ok(Body::from_stream(futures_util::StreamExt::chain(
+        first, rest,
+    )))
 }
 
 // ---- errors ----
@@ -271,6 +350,8 @@ struct Target {
     bucket: Option<String>,
     key: Option<String>,
     query: Vec<(String, String)>,
+    /// The bucket came from the Host header.
+    virtual_host: bool,
 }
 
 impl Target {
@@ -290,6 +371,7 @@ struct Req<'a> {
     headers: &'a HeaderMap,
     payload: Payload,
     now_ms: i64,
+    state: &'a Shared,
 }
 
 /// Decoded request body plus its integrity information.
@@ -471,7 +553,7 @@ impl Req<'_> {
     }
 }
 
-fn parse_target(uri: &Uri) -> Result<Target, S3Error> {
+fn parse_target(uri: &Uri, host_bucket: Option<String>) -> Result<Target, S3Error> {
     let path = uri.path().to_owned();
     let decode = |s: &str| {
         percent_decode_str(s)
@@ -480,11 +562,21 @@ fn parse_target(uri: &Uri) -> Result<Target, S3Error> {
             .map_err(|_| bad("InvalidURI", "Couldn't parse the specified URI."))
     };
     let rest = path.strip_prefix('/').unwrap_or(&path);
-    let (bucket, key) = match rest.split_once('/') {
-        Some((b, k)) => (b, Some(k)),
-        None => (rest, None),
+    let virtual_host = host_bucket.is_some();
+    let (bucket, key) = match host_bucket {
+        // Virtual-hosted style: the whole path is the key.
+        Some(b) => (Some(b), Some(rest)),
+        None => {
+            let (bucket, key) = match rest.split_once('/') {
+                Some((b, k)) => (b, Some(k)),
+                None => (rest, None),
+            };
+            (
+                (!bucket.is_empty()).then(|| decode(bucket)).transpose()?,
+                key,
+            )
+        }
     };
-    let bucket = (!bucket.is_empty()).then(|| decode(bucket)).transpose()?;
     let key = key.filter(|k| !k.is_empty()).map(decode).transpose()?;
     let query: Vec<(String, String)> = serde_urlencoded::from_str(uri.query().unwrap_or_default())
         .map_err(|_| bad("InvalidURI", "Couldn't parse the specified URI."))?;
@@ -497,7 +589,26 @@ fn parse_target(uri: &Uri) -> Result<Target, S3Error> {
         bucket,
         key,
         query,
+        virtual_host,
     })
+}
+
+/// Presigned URLs may carry signed `x-amz-*` headers as query parameters
+/// (e.g. `X-Amz-Checksum-Mode`). They are moved back into the headers, so the
+/// per-operation header allowlists apply to them as usual.
+fn hoist_presigned_headers(target: &mut Target, headers: &mut HeaderMap) {
+    target.query.retain(|(k, v)| {
+        let name = k.to_ascii_lowercase();
+        if !name.starts_with("x-amz-") {
+            return true;
+        }
+        if let (Ok(name), Ok(value)) = (HeaderName::try_from(name), HeaderValue::from_str(v)) {
+            headers.entry(name).or_insert(value);
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Decodes an `aws-chunked` body: `hex-size[;ext]\r\n<data>\r\n ... 0[;ext]\r\n<trailers>\r\n`.
@@ -664,12 +775,25 @@ async fn handle(
     State(state): State<Shared>,
     method: Method,
     uri: Uri,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Body,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().simple().to_string()[..16].to_uppercase();
     let head = method == Method::HEAD;
-    let target = parse_target(&uri);
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.authority().map(|a| a.as_str()))
+        .unwrap_or_default();
+    let host_bucket = virtual_host_bucket(&state.domains, host);
+    // LS2's own pages; bucket names cannot start with `_`, so path-style keys never collide.
+    if host_bucket.is_none() && (uri.path() == "/_ls2" || uri.path().starts_with("/_ls2/")) {
+        return browse::handle(&state, &method, &uri);
+    }
+    let mut target = parse_target(&uri, host_bucket);
+    if let Ok(t) = &mut target {
+        hoist_presigned_headers(t, &mut headers);
+    }
     let result = async {
         let target = target
             .as_ref()
@@ -705,6 +829,7 @@ async fn handle(
             headers: &headers,
             payload,
             now_ms: now(),
+            state: &state,
         };
         let mut ls2 = lock(&state)?;
         dispatch(&mut ls2, &method, &req)
@@ -1182,14 +1307,13 @@ fn get_object(ls2: &mut Ls2, r: &Req, head: bool) -> Result<Response, S3Error> {
         Some(v) => ByteRange::parse(v),
         None => None,
     };
-    let cond = r.read_condition();
-    let (info, data, applied) = if head {
-        let info = ls2.head_object_if(r.bucket(), r.key(), &cond)?;
-        let applied = range.map(|x| x.resolve(info.size)).transpose()?;
-        (info, None, applied)
+    let handle = ls2.open_object(r.bucket(), r.key(), range, &r.read_condition())?;
+    let applied = handle.partial.then_some((handle.start, handle.end));
+    let info = handle.info.clone();
+    let body = if head {
+        Body::empty()
     } else {
-        let out = ls2.get_object(r.bucket(), r.key(), range, &cond)?;
-        (out.info, Some(out.data), out.range)
+        object_body(ls2, r.state, handle)?
     };
     let m = &info.metadata;
     let mut response = Response::new(Body::empty());
@@ -1252,9 +1376,7 @@ fn get_object(ls2: &mut Ls2, r: &Req, head: bool) -> Result<Response, S3Error> {
     response
         .headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
-    if let Some(data) = data {
-        *response.body_mut() = Body::from(data);
-    }
+    *response.body_mut() = body;
     Ok(response)
 }
 
@@ -1479,11 +1601,12 @@ fn complete_upload(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
         r.now_ms,
     )?;
     let host = r.header("host").unwrap_or("localhost");
-    let location = format!(
-        "http://{host}/{}/{}",
-        r.bucket(),
-        utf8_percent_encode(r.key(), URL_ENCODE)
-    );
+    let key = utf8_percent_encode(r.key(), URL_ENCODE);
+    let location = if r.target.virtual_host {
+        format!("http://{host}/{key}")
+    } else {
+        format!("http://{host}/{}/{key}", r.bucket())
+    };
     let body = xml_doc(
         "CompleteMultipartUploadResult",
         &(tag("Location", &location)

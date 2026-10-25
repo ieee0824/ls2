@@ -612,6 +612,70 @@ fn state_survives_reopen() {
     );
 }
 
+#[test]
+fn incremental_reads_detect_replacement() {
+    let mut s = ls2_with("bkt");
+    let id = s
+        .create_multipart_upload("bkt", "big", Metadata::default(), None, T)
+        .unwrap();
+    let part1 = vec![b'a'; MIN_PART_SIZE as usize];
+    let p1 = s
+        .upload_part(
+            "bkt",
+            "big",
+            &id,
+            1,
+            &part1,
+            ChecksumInput::Default,
+            None,
+            T,
+        )
+        .unwrap();
+    let p2 = s
+        .upload_part(
+            "bkt",
+            "big",
+            &id,
+            2,
+            b"bcd",
+            ChecksumInput::Default,
+            None,
+            T,
+        )
+        .unwrap();
+    let parts: Vec<CompletedPart> = [p1, p2]
+        .into_iter()
+        .map(|p| CompletedPart {
+            part_number: p.part_number,
+            etag: p.etag,
+            checksum: None,
+        })
+        .collect();
+    s.complete_multipart_upload("bkt", "big", &id, &parts, &WriteCondition::default(), T)
+        .unwrap();
+
+    let range = ByteRange::From {
+        start: MIN_PART_SIZE - 2,
+        end: None,
+    };
+    let h = s
+        .open_object("bkt", "big", Some(range), &ReadCondition::default())
+        .unwrap();
+    assert_eq!(
+        (h.start, h.end, h.partial),
+        (MIN_PART_SIZE - 2, MIN_PART_SIZE + 3, true)
+    );
+    // A read spanning both chunks, then one clamped at the end of the object.
+    assert_eq!(s.read_object(&h, h.start, 4).unwrap(), b"aabc");
+    assert_eq!(s.read_object(&h, MIN_PART_SIZE + 2, 100).unwrap(), b"d");
+
+    put(&mut s, "bkt", "big", b"replaced");
+    assert!(matches!(
+        s.read_object(&h, h.start, 4),
+        Err(Error::InvalidRequest(_))
+    ));
+}
+
 // ---- HTTP ----
 
 struct Http(axum::Router);
@@ -628,6 +692,26 @@ impl Http {
             parts.headers,
             to_bytes(body, usize::MAX).await.unwrap().to_vec(),
         )
+    }
+    /// Request with a Host header (virtual-hosted style when it is `<bucket>.localhost`).
+    async fn on_host(
+        &self,
+        host: &str,
+        method: &str,
+        uri: &str,
+        body: impl Into<Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let (status, headers, body) = self
+            .send(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", host)
+                    .body(body.into())
+                    .unwrap(),
+            )
+            .await;
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
     }
     async fn call(
         &self,
@@ -797,6 +881,21 @@ async fn http_rejects_unsupported_features() {
         .call("PUT", "/bucket/k?x-id=PutObject&X-Amz-Signature=abc", "x")
         .await;
     assert_eq!(status, StatusCode::OK);
+    // Presigned URLs carry signed x-amz-* headers in the query; they obey the allowlists.
+    let (status, headers, _) = http
+        .call(
+            "GET",
+            "/bucket/k?X-Amz-Checksum-Mode=ENABLED",
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.contains_key("x-amz-checksum-crc64nvme"));
+    let (status, _, body) = http
+        .call("PUT", "/bucket/k2?X-Amz-Tagging=a%3Db", "x")
+        .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert!(body.contains("x-amz-tagging"), "{body}");
     let req = Request::get("/bucket/k")
         .header("x-amz-expected-bucket-owner", "123456789012")
         .body(Body::empty())
@@ -950,4 +1049,196 @@ async fn http_copy_and_multipart() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body.contains("<UploadId>"), "{body}");
+}
+
+#[tokio::test]
+async fn http_virtual_hosted_style() {
+    let http = Http::new();
+    let vhost = "photos.localhost:9326";
+    assert_eq!(http.on_host(vhost, "PUT", "/", "").await.0, StatusCode::OK);
+    let (status, _, _) = http.on_host(vhost, "PUT", "/2024/a%20b.jpg", "img").await;
+    assert_eq!(status, StatusCode::OK);
+    // Under a virtual host, `/_ls2/...` is an ordinary key.
+    http.on_host(vhost, "PUT", "/_ls2/health", "key").await;
+    assert_eq!(
+        http.on_host(vhost, "GET", "/_ls2/health", "").await.2,
+        "key"
+    );
+
+    let (_, _, body) = http
+        .on_host(vhost, "GET", "/?list-type=2&prefix=2024%2F", "")
+        .await;
+    assert!(
+        body.contains("<Name>photos</Name>") && body.contains("<Key>2024/a b.jpg</Key>"),
+        "{body}"
+    );
+    // Path-style on localhost and IP hosts reaches the same bucket.
+    assert_eq!(
+        http.on_host("localhost:9326", "GET", "/photos/2024/a%20b.jpg", "")
+            .await
+            .2,
+        "img"
+    );
+    assert_eq!(
+        http.on_host("127.0.0.1:9326", "GET", "/photos/2024/a%20b.jpg", "")
+            .await
+            .2,
+        "img"
+    );
+    assert_eq!(
+        http.on_host("PHOTOS.LOCALHOST", "GET", "/2024/a%20b.jpg", "")
+            .await
+            .2,
+        "img"
+    );
+    let (status, _, body) = http.on_host("nope.localhost", "GET", "/k", "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains("NoSuchBucket") && body.contains("<BucketName>nope</BucketName>"),
+        "{body}"
+    );
+
+    let (_, _, body) = http.on_host(vhost, "POST", "/mp?uploads", "").await;
+    let id = body
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split('<')
+        .next()
+        .unwrap()
+        .to_owned();
+    let (_, headers, _) = http
+        .on_host(
+            vhost,
+            "PUT",
+            &format!("/mp?partNumber=1&uploadId={id}"),
+            "tail",
+        )
+        .await;
+    let etag = headers["etag"].to_str().unwrap().to_owned();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (status, _, body) = http
+        .on_host(vhost, "POST", &format!("/mp?uploadId={id}"), complete)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("<Location>http://photos.localhost:9326/mp</Location>"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn http_streams_large_objects() {
+    let http = Http::new();
+    http.call("PUT", "/bucket", "").await;
+    let data: Vec<u8> = (0..3 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+    http.call("PUT", "/bucket/big", data.clone()).await;
+    let (status, headers, body) = http
+        .send(Request::get("/bucket/big").body(Body::empty()).unwrap())
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-length"], data.len().to_string().as_str());
+    assert!(body == data, "streamed body differs");
+
+    let req = Request::get("/bucket/big")
+        .header("range", "bytes=1048570-2097160")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = http.send(req).await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert!(body == data[1_048_570..=2_097_160], "ranged body differs");
+}
+
+#[tokio::test]
+async fn http_browse_pages() {
+    let http = Http::new();
+    http.call("PUT", "/bucket", "").await;
+    let req = Request::put("/bucket/docs/%3Ci%3Ehi%26.txt")
+        .header("content-type", "text/html")
+        .header("x-amz-meta-note", "<script>alert(1)</script>")
+        .body(Body::from("<p>body</p>"))
+        .unwrap();
+    http.send(req).await;
+    http.call("PUT", "/bucket/top.bin", vec![0u8, 1, 2]).await;
+
+    let (status, headers, body) = http.call("GET", "/_ls2/browse", Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(
+        headers["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("default-src 'none'")
+    );
+    assert!(body.contains("href=\"/_ls2/browse/bucket\""), "{body}");
+
+    let (_, _, body) = http.call("GET", "/_ls2/browse/bucket", Body::empty()).await;
+    assert!(
+        body.contains("href=\"/_ls2/browse/bucket?prefix=docs/\""),
+        "{body}"
+    );
+    assert!(body.contains("top.bin"));
+
+    let (_, _, body) = http
+        .call("GET", "/_ls2/browse/bucket?prefix=docs%2F", Body::empty())
+        .await;
+    assert!(
+        body.contains("&lt;i&gt;hi&amp;.txt") && !body.contains("<i>hi"),
+        "{body}"
+    );
+
+    let (_, _, body) = http
+        .call(
+            "GET",
+            "/_ls2/browse/bucket?key=docs%2F%3Ci%3Ehi%26.txt",
+            Body::empty(),
+        )
+        .await;
+    assert!(
+        body.contains("&lt;script&gt;alert(1)&lt;/script&gt;") && !body.contains("<script>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<pre>&lt;p&gt;body&lt;/p&gt;</pre>"),
+        "text preview: {body}"
+    );
+    let (_, _, body) = http
+        .call("GET", "/_ls2/browse/bucket?key=top.bin", Body::empty())
+        .await;
+    assert!(!body.contains("<pre>"), "binary objects have no preview");
+
+    let (status, headers, body) = http
+        .call(
+            "GET",
+            "/_ls2/download/bucket?key=docs%2F%3Ci%3Ehi%26.txt",
+            Body::empty(),
+        )
+        .await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "<p>body</p>"));
+    assert_eq!(headers["content-type"], "application/octet-stream");
+    assert!(
+        headers["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;")
+    );
+
+    let (status, _, body) = http
+        .call("GET", "/_ls2/browse/missing", Body::empty())
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("NoSuchBucket"));
+    let (_, _, body) = http.call("GET", "/_ls2/status", Body::empty()).await;
+    assert!(body.contains("\"objects\":2"), "{body}");
+    assert_eq!(
+        http.call("POST", "/_ls2/browse", Body::empty()).await.0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
 }
