@@ -74,6 +74,17 @@ if s3 s3api put-object --bucket "$bucket" --key sha.txt --body "$work/small.txt"
   exit 1
 fi
 
+step "tagging and CORS"
+s3 s3api put-object-tagging --bucket "$bucket" --key sha.txt \
+  --tagging 'TagSet=[{Key=env,Value=dev}]'
+tag_value=$(s3 s3api get-object-tagging --bucket "$bucket" --key sha.txt --query 'TagSet[0].Value' --output text)
+[ "$tag_value" = dev ]
+s3 s3api put-bucket-cors --bucket "$bucket" --cors-configuration \
+  '{"CORSRules":[{"AllowedOrigins":["http://localhost:3000"],"AllowedMethods":["GET"]}]}'
+allow_origin=$(curl --fail --silent -o /dev/null -X OPTIONS -w '%header{access-control-allow-origin}' \
+  -H 'Origin: http://localhost:3000' -H 'Access-Control-Request-Method: GET' "$endpoint/$bucket/sha.txt")
+[ "$allow_origin" = "http://localhost:3000" ]
+
 step "versioning"
 s3 s3api put-bucket-versioning --bucket "$bucket" --versioning-configuration Status=Enabled
 printf 'v1' >"$work/v1.txt"

@@ -3,9 +3,10 @@ use axum::{
     http::{Request, StatusCode},
 };
 use ls2::{
-    ByteRange, ChecksumAlgorithm, ChecksumInput, CompletedPart, CopySource, DeleteOutcome, Error,
-    ListRequest, Ls2, MIN_PART_SIZE, Metadata, NULL_VERSION, ObjectId, PutOptions, ReadCondition,
-    VersionListRequest, Versioning, WriteCondition, checksum::Checksum,
+    ByteRange, ChecksumAlgorithm, ChecksumInput, CompletedPart, CopyOptions, CopySource, CorsRule,
+    DeleteOutcome, Error, ListRequest, Ls2, MAX_OBJECT_TAGS, MIN_PART_SIZE, Metadata, NULL_VERSION,
+    ObjectId, PutOptions, ReadCondition, Tags, VersionListRequest, Versioning, WriteCondition,
+    checksum::Checksum, tags_from_pairs,
 };
 use tower::ServiceExt;
 
@@ -71,7 +72,7 @@ fn bucket_lifecycle() {
 
     put(&mut s, "alpha", "k", b"x");
     let id = s
-        .create_multipart_upload("alpha", "u", Metadata::default(), None, T)
+        .create_multipart_upload("alpha", "u", Metadata::default(), Tags::new(), None, T)
         .unwrap();
     assert!(matches!(
         s.delete_bucket("alpha"),
@@ -397,7 +398,13 @@ fn copy_object_directives() {
         ..Default::default()
     };
     assert!(matches!(
-        s.copy_object(&source("bkt", "src", stale), "other", "dst", None, T),
+        s.copy_object(
+            &source("bkt", "src", stale),
+            "other",
+            "dst",
+            CopyOptions::default(),
+            T
+        ),
         Err(Error::PreconditionFailed)
     ));
     let same = ReadCondition {
@@ -405,7 +412,13 @@ fn copy_object_directives() {
         ..Default::default()
     };
     assert!(matches!(
-        s.copy_object(&source("bkt", "src", same), "other", "dst", None, T),
+        s.copy_object(
+            &source("bkt", "src", same),
+            "other",
+            "dst",
+            CopyOptions::default(),
+            T
+        ),
         Err(Error::PreconditionFailed)
     ));
     let copy = s
@@ -413,7 +426,7 @@ fn copy_object_directives() {
             &source("bkt", "src", any.clone()),
             "other",
             "dst",
-            None,
+            CopyOptions::default(),
             T + 1,
         )
         .unwrap()
@@ -430,7 +443,13 @@ fn copy_object_directives() {
     );
 
     assert!(matches!(
-        s.copy_object(&source("bkt", "src", any.clone()), "bkt", "src", None, T),
+        s.copy_object(
+            &source("bkt", "src", any.clone()),
+            "bkt",
+            "src",
+            CopyOptions::default(),
+            T
+        ),
         Err(Error::InvalidRequest(_))
     ));
     let replaced = Metadata {
@@ -441,7 +460,10 @@ fn copy_object_directives() {
         &source("bkt", "src", any.clone()),
         "bkt",
         "src",
-        Some(replaced.clone()),
+        CopyOptions {
+            metadata: Some(replaced.clone()),
+            tags: None,
+        },
         T + 2,
     )
     .unwrap();
@@ -456,7 +478,13 @@ fn copy_object_directives() {
         b"payload"
     );
     assert!(matches!(
-        s.copy_object(&source("bkt", "none", any), "bkt", "x", None, T),
+        s.copy_object(
+            &source("bkt", "none", any),
+            "bkt",
+            "x",
+            CopyOptions::default(),
+            T
+        ),
         Err(Error::NoSuchKey)
     ));
 }
@@ -469,6 +497,7 @@ fn multipart_upload_round_trip() {
             "bkt",
             "big",
             Metadata::default(),
+            Tags::new(),
             Some(ChecksumAlgorithm::Crc32),
             T,
         )
@@ -546,7 +575,7 @@ fn multipart_upload_round_trip() {
 fn multipart_rules() {
     let mut s = ls2_with("bkt");
     let id = s
-        .create_multipart_upload("bkt", "k", Metadata::default(), None, T)
+        .create_multipart_upload("bkt", "k", Metadata::default(), Tags::new(), None, T)
         .unwrap();
     let p1 = s
         .upload_part(
@@ -592,7 +621,7 @@ fn multipart_rules() {
 
     put(&mut s, "bkt", "src", b"0123456789");
     let id = s
-        .create_multipart_upload("bkt", "k", Metadata::default(), None, T)
+        .create_multipart_upload("bkt", "k", Metadata::default(), Tags::new(), None, T)
         .unwrap();
     let (copied, _) = s
         .upload_part_copy(
@@ -619,7 +648,7 @@ fn state_survives_reopen() {
         let mut s = Ls2::open(&path).unwrap();
         s.create_bucket("bkt", None, T).unwrap();
         put(&mut s, "bkt", "k", b"persisted");
-        s.create_multipart_upload("bkt", "u", Metadata::default(), None, T)
+        s.create_multipart_upload("bkt", "u", Metadata::default(), Tags::new(), None, T)
             .unwrap();
     }
     let s = Ls2::open(&path).unwrap();
@@ -642,7 +671,7 @@ fn state_survives_reopen() {
 fn incremental_reads_detect_replacement() {
     let mut s = ls2_with("bkt");
     let id = s
-        .create_multipart_upload("bkt", "big", Metadata::default(), None, T)
+        .create_multipart_upload("bkt", "big", Metadata::default(), Tags::new(), None, T)
         .unwrap();
     let part1 = vec![b'a'; MIN_PART_SIZE as usize];
     let p1 = s
@@ -791,7 +820,9 @@ fn versioning_keeps_history_and_delete_markers() {
     // Copying an old version creates a new latest version.
     let mut src = source("bkt", "k", ReadCondition::default());
     src.version_id = Some(NULL_VERSION.into());
-    let (copy, copied_from) = s.copy_object(&src, "bkt", "k", None, T + 3).unwrap();
+    let (copy, copied_from) = s
+        .copy_object(&src, "bkt", "k", CopyOptions::default(), T + 3)
+        .unwrap();
     assert_eq!(copied_from, NULL_VERSION);
     assert_eq!(read(&s, None).unwrap(), b"v0");
     assert_eq!(
@@ -870,6 +901,156 @@ fn version_listing_pages_and_groups() {
         ),
         Err(Error::InvalidArgument(_))
     ));
+}
+
+fn tags(pairs: &[(&str, &str)]) -> Tags {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn object_and_bucket_tags() {
+    let mut s = ls2_with("bkt");
+    let tagged = PutOptions {
+        tags: tags(&[("env", "dev"), ("team", "s3")]),
+        ..Default::default()
+    };
+    s.put_object("bkt", "k", b"x", tagged, T).unwrap();
+    assert_eq!(
+        s.get_object_tagging("bkt", "k", None).unwrap(),
+        (
+            NULL_VERSION.to_string(),
+            tags(&[("env", "dev"), ("team", "s3")])
+        )
+    );
+    s.put_object_tagging("bkt", "k", None, tags(&[("only", "one")]))
+        .unwrap();
+    assert_eq!(
+        s.head_object("bkt", "k", None).unwrap().tags,
+        tags(&[("only", "one")])
+    );
+
+    // COPY keeps the source tags, REPLACE sets new ones.
+    let (copy, _) = s
+        .copy_object(
+            &source("bkt", "k", ReadCondition::default()),
+            "bkt",
+            "c1",
+            CopyOptions::default(),
+            T,
+        )
+        .unwrap();
+    assert_eq!(copy.tags, tags(&[("only", "one")]));
+    let (copy, _) = s
+        .copy_object(
+            &source("bkt", "k", ReadCondition::default()),
+            "bkt",
+            "c2",
+            CopyOptions {
+                metadata: None,
+                tags: Some(Tags::new()),
+            },
+            T,
+        )
+        .unwrap();
+    assert!(copy.tags.is_empty());
+
+    // Tags apply per version.
+    s.set_bucket_versioning("bkt", Versioning::Enabled).unwrap();
+    let v1 = put(&mut s, "bkt", "k", b"v1");
+    s.put_object_tagging("bkt", "k", Some(&v1.version_id), tags(&[("v", "1")]))
+        .unwrap();
+    assert_eq!(
+        s.get_object_tagging("bkt", "k", Some(NULL_VERSION))
+            .unwrap()
+            .1,
+        tags(&[("only", "one")])
+    );
+    s.delete_object_tagging("bkt", "k", None).unwrap();
+    assert!(s.get_object_tagging("bkt", "k", None).unwrap().1.is_empty());
+
+    // Multipart uploads apply their tags on completion.
+    let id = s
+        .create_multipart_upload(
+            "bkt",
+            "mp",
+            Metadata::default(),
+            tags(&[("mp", "yes")]),
+            None,
+            T,
+        )
+        .unwrap();
+    let p = s
+        .upload_part("bkt", "mp", &id, 1, b"x", ChecksumInput::Default, None, T)
+        .unwrap();
+    let parts = [CompletedPart {
+        part_number: 1,
+        etag: p.etag,
+        checksum: None,
+    }];
+    let info = s
+        .complete_multipart_upload("bkt", "mp", &id, &parts, &WriteCondition::default(), T)
+        .unwrap();
+    assert_eq!(info.tags, tags(&[("mp", "yes")]));
+
+    // Validation follows S3.
+    let pairs = |n: usize| (0..n).map(|i| (format!("k{i}"), String::new()));
+    assert!(tags_from_pairs(pairs(MAX_OBJECT_TAGS), MAX_OBJECT_TAGS).is_ok());
+    for bad in [
+        tags_from_pairs(pairs(MAX_OBJECT_TAGS + 1), MAX_OBJECT_TAGS),
+        tags_from_pairs([("a".into(), "1".into()), ("a".into(), "2".into())], 10),
+        tags_from_pairs([("aws:x".into(), String::new())], 10),
+        tags_from_pairs([("k".repeat(129), String::new())], 10),
+        tags_from_pairs([("bad!".into(), String::new())], 10),
+    ] {
+        assert!(matches!(bad, Err(Error::InvalidTag(_))), "{bad:?}");
+    }
+
+    assert_eq!(s.get_bucket_tagging("bkt").unwrap(), None);
+    s.put_bucket_tagging("bkt", tags(&[("cost", "1")])).unwrap();
+    assert_eq!(
+        s.get_bucket_tagging("bkt").unwrap(),
+        Some(tags(&[("cost", "1")]))
+    );
+    s.delete_bucket_tagging("bkt").unwrap();
+    assert_eq!(s.get_bucket_tagging("bkt").unwrap(), None);
+    assert!(matches!(
+        s.get_bucket_tagging("nope"),
+        Err(Error::NoSuchBucket)
+    ));
+}
+
+#[test]
+fn cors_configuration_rules() {
+    let mut s = ls2_with("bkt");
+    assert_eq!(s.get_bucket_cors("bkt").unwrap(), None);
+    let rule = CorsRule {
+        allowed_origins: vec!["http://localhost:3000".into()],
+        allowed_methods: vec!["GET".into(), "PUT".into()],
+        ..Default::default()
+    };
+    s.put_bucket_cors("bkt", vec![rule.clone()]).unwrap();
+    assert_eq!(s.get_bucket_cors("bkt").unwrap(), Some(vec![rule.clone()]));
+    let mut bad = rule.clone();
+    bad.allowed_methods = vec!["PATCH".into()];
+    assert!(matches!(
+        s.put_bucket_cors("bkt", vec![bad]),
+        Err(Error::InvalidRequest(_))
+    ));
+    let mut bad = rule.clone();
+    bad.allowed_origins = vec!["http://*.*.test".into()];
+    assert!(matches!(
+        s.put_bucket_cors("bkt", vec![bad]),
+        Err(Error::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        s.put_bucket_cors("bkt", vec![]),
+        Err(Error::InvalidArgument(_))
+    ));
+    s.delete_bucket_cors("bkt").unwrap();
+    assert_eq!(s.get_bucket_cors("bkt").unwrap(), None);
 }
 
 // ---- HTTP ----
@@ -1060,12 +1241,12 @@ async fn http_rejects_unsupported_features() {
     assert!(body.contains("Unsupported query parameter: acl"), "{body}");
 
     let req = Request::put("/bucket/k")
-        .header("x-amz-tagging", "a=b")
+        .header("x-amz-server-side-encryption", "AES256")
         .body(Body::from("x"))
         .unwrap();
     let (status, _, body) = http.send(req).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert!(String::from_utf8_lossy(&body).contains("x-amz-tagging"));
+    assert!(String::from_utf8_lossy(&body).contains("x-amz-server-side-encryption"));
 
     let req = Request::put("/bucket/k")
         .header("x-amz-storage-class", "GLACIER")
@@ -1088,10 +1269,10 @@ async fn http_rejects_unsupported_features() {
     assert_eq!(status, StatusCode::OK);
     assert!(headers.contains_key("x-amz-checksum-crc64nvme"));
     let (status, _, body) = http
-        .call("PUT", "/bucket/k2?X-Amz-Tagging=a%3Db", "x")
+        .call("PUT", "/bucket/k2?X-Amz-Server-Side-Encryption=AES256", "x")
         .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert!(body.contains("x-amz-tagging"), "{body}");
+    assert!(body.contains("x-amz-server-side-encryption"), "{body}");
     let req = Request::get("/bucket/k")
         .header("x-amz-expected-bucket-owner", "123456789012")
         .body(Body::empty())
@@ -1557,5 +1738,170 @@ async fn http_versioning() {
     assert!(
         body.contains("<h2>Versions</h2>") && body.contains(&v1),
         "{body}"
+    );
+}
+
+#[tokio::test]
+async fn http_tagging() {
+    let http = Http::new();
+    http.call("PUT", "/bucket", "").await;
+    let req = Request::put("/bucket/k")
+        .header("x-amz-tagging", "env=dev&note=a%20b")
+        .body(Body::from("x"))
+        .unwrap();
+    assert_eq!(http.send(req).await.0, StatusCode::OK);
+    let (_, headers, _) = http.call("HEAD", "/bucket/k", Body::empty()).await;
+    assert_eq!(headers["x-amz-tagging-count"], "2");
+    let (_, _, body) = http.call("GET", "/bucket/k?tagging", Body::empty()).await;
+    assert!(
+        body.contains("<Tag><Key>env</Key><Value>dev</Value></Tag><Tag><Key>note</Key><Value>a b</Value></Tag>"),
+        "{body}"
+    );
+
+    let put = "<Tagging><TagSet><Tag><Key>new</Key><Value></Value></Tag></TagSet></Tagging>";
+    assert_eq!(
+        http.call("PUT", "/bucket/k?tagging", put).await.0,
+        StatusCode::OK
+    );
+    let (_, _, body) = http.call("GET", "/bucket/k?tagging", Body::empty()).await;
+    assert!(
+        body.contains("<Key>new</Key><Value></Value>") && !body.contains("env"),
+        "{body}"
+    );
+    let (status, _, body) = http
+        .call(
+            "PUT",
+            "/bucket/k?tagging",
+            "<Tagging><TagSet><Tag><Key>aws:x</Key><Value>1</Value></Tag></TagSet></Tagging>",
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidTag"), "{body}");
+    assert_eq!(
+        http.call("DELETE", "/bucket/k?tagging", Body::empty())
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, headers, _) = http.call("HEAD", "/bucket/k", Body::empty()).await;
+    assert!(!headers.contains_key("x-amz-tagging-count"));
+
+    // Copy with REPLACE takes x-amz-tagging; COPY keeps the source tags.
+    http.call("PUT", "/bucket/k?tagging", put).await;
+    let req = Request::put("/bucket/copy")
+        .header("x-amz-copy-source", "bucket/k")
+        .header("x-amz-tagging-directive", "REPLACE")
+        .header("x-amz-tagging", "replaced=1")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(http.send(req).await.0, StatusCode::OK);
+    let (_, _, body) = http
+        .call("GET", "/bucket/copy?tagging", Body::empty())
+        .await;
+    assert!(body.contains("<Key>replaced</Key>"), "{body}");
+
+    let (status, _, body) = http.call("GET", "/bucket?tagging", Body::empty()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("NoSuchTagSet"));
+    let bucket_tags =
+        "<Tagging><TagSet><Tag><Key>cost</Key><Value>dev</Value></Tag></TagSet></Tagging>";
+    assert_eq!(
+        http.call("PUT", "/bucket?tagging", bucket_tags).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, _, body) = http.call("GET", "/bucket?tagging", Body::empty()).await;
+    assert!(body.contains("<Key>cost</Key>"), "{body}");
+    assert_eq!(
+        http.call("DELETE", "/bucket?tagging", Body::empty())
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn http_cors() {
+    let http = Http::new();
+    http.call("PUT", "/bucket", "").await;
+    http.call("PUT", "/bucket/k", "x").await;
+    let preflight = |origin: &str, method: &str, headers: &str| {
+        let mut req = Request::builder()
+            .method("OPTIONS")
+            .uri("/bucket/k?X-Amz-Signature=abc")
+            .header("origin", origin)
+            .header("access-control-request-method", method);
+        if !headers.is_empty() {
+            req = req.header("access-control-request-headers", headers);
+        }
+        req.body(Body::empty()).unwrap()
+    };
+    let (status, _, body) = http.send(preflight("http://app.test", "PUT", "")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(String::from_utf8_lossy(&body).contains("CORS is not enabled"));
+    let (status, _, _) = http.call("GET", "/bucket?cors", Body::empty()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let config = "<CORSConfiguration><CORSRule><AllowedOrigin>http://app.test</AllowedOrigin><AllowedMethod>PUT</AllowedMethod><AllowedMethod>GET</AllowedMethod><AllowedHeader>content-type</AllowedHeader><ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>300</MaxAgeSeconds></CORSRule><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>";
+    assert_eq!(
+        http.call("PUT", "/bucket?cors", config).await.0,
+        StatusCode::OK
+    );
+    let (_, _, body) = http.call("GET", "/bucket?cors", Body::empty()).await;
+    assert!(
+        body.contains("<AllowedOrigin>http://app.test</AllowedOrigin>")
+            && body.contains("<MaxAgeSeconds>300</MaxAgeSeconds>"),
+        "{body}"
+    );
+
+    let (status, headers, _) = http
+        .send(preflight("http://app.test", "PUT", "Content-Type"))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["access-control-allow-origin"], "http://app.test");
+    assert_eq!(headers["access-control-allow-methods"], "PUT, GET");
+    assert_eq!(headers["access-control-allow-headers"], "content-type");
+    assert_eq!(headers["access-control-max-age"], "300");
+    assert_eq!(headers["access-control-allow-credentials"], "true");
+    let (status, _, _) = http
+        .send(preflight("http://app.test", "PUT", "authorization"))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, headers, _) = http.send(preflight("http://other.test", "GET", "")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["access-control-allow-origin"], "*");
+
+    // Actual requests from an allowed origin carry the CORS headers, errors included.
+    let req = Request::get("/bucket/k")
+        .header("origin", "http://app.test")
+        .body(Body::empty())
+        .unwrap();
+    let (_, headers, _) = http.send(req).await;
+    assert_eq!(headers["access-control-allow-origin"], "http://app.test");
+    assert_eq!(headers["access-control-expose-headers"], "ETag");
+    let req = Request::get("/bucket/missing")
+        .header("origin", "http://app.test")
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, _) = http.send(req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(headers.contains_key("access-control-allow-origin"));
+    let req = Request::delete("/bucket/k")
+        .header("origin", "http://other.test")
+        .body(Body::empty())
+        .unwrap();
+    let (_, headers, _) = http.send(req).await;
+    assert!(
+        !headers.contains_key("access-control-allow-origin"),
+        "DELETE is not allowed for *"
+    );
+
+    assert_eq!(
+        http.call("DELETE", "/bucket?cors", Body::empty()).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let bad = "<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>PATCH</AllowedMethod></CORSRule></CORSConfiguration>";
+    assert_eq!(
+        http.call("PUT", "/bucket?cors", bad).await.0,
+        StatusCode::BAD_REQUEST
     );
 }
