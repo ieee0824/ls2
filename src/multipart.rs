@@ -1,5 +1,6 @@
 //! Multipart uploads. Parts live in SQLite until completion copies them into object chunks.
 use crate::checksum::{self, Checksum, ChecksumAlgorithm, ChecksumInput};
+use crate::notification::{EventObject, Principal, emit};
 use crate::{
     ByteRange, CopySource, Error, Ls2, MAX_LIST, MAX_PART_NUMBER, MIN_PART_SIZE, Metadata,
     ObjectInfo, Tags, WriteCondition, bucket_versioning, check_write_condition, from_json,
@@ -298,6 +299,9 @@ impl Ls2 {
             offset += part.size;
         }
         tx.execute("DELETE FROM uploads WHERE id=?1", [upload_id])?;
+        let object = EventObject::created(&info);
+        let event = "ObjectCreated:CompleteMultipartUpload";
+        emit(&tx, bucket, event, &object, Principal::Request, now_ms)?;
         tx.commit()?;
         Ok(info)
     }

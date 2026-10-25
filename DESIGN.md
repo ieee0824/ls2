@@ -19,12 +19,14 @@ HTTP からも Rust からも同じ検証を通ります。HTTP は `Mutex` で1
 
 ```text
 buckets(name, region, created_at_ms)
-buckets(..., versioning, tags JSON, cors JSON)                                            versioning: NULL / Enabled / Suspended
+buckets(..., versioning, tags JSON, cors JSON, lifecycle JSON, notification JSON)        versioning: NULL / Enabled / Suspended
 objects(id, bucket, key BLOB, version_id, is_latest, delete_marker,
         size, etag, last_modified_ms, metadata JSON, checksum JSON, tags JSON)             UNIQUE(bucket, key, version_id)
 chunks(object_id, seq, offset, size, data BLOB)                                            PK(object_id, seq)
 uploads(id, bucket, key BLOB, initiated_at_ms, metadata JSON, checksum_algorithm)
 parts(upload_id, part_number, size, etag, last_modified_ms, checksum JSON, data BLOB)      PK(upload_id, part_number)
+notifications(id, queue_arn, body, created_at_ms, attempts, next_attempt_ms, last_error, failed)
+counters(name, value)                                                                     イベントの sequencer
 ```
 
 - **キーは BLOB** で保存します。SQLite の BLOB 比較は memcmp なので、S3 と同じ UTF-8 バイト順で一覧できます。prefix の範囲は「prefix 以上、末尾バイトを1つ増やした値未満」で索引を使います。
@@ -46,6 +48,27 @@ parts(upload_id, part_number, size, etag, last_modified_ms, checksum JSON, data 
 タグはバージョンの行（オブジェクト）とバケットの行に JSON で持ちます。S3 と同じくタグの変更は ETag・更新時刻を変えないため、ダウンロード中にタグを変えても読み出しは続きます。マルチパートアップロードの `x-amz-tagging` はアップロードの行に保存し、完了時にオブジェクトへ移します。v2 → v3 は列の追加だけなので `ALTER TABLE ADD COLUMN` で移行します。
 
 CORS は S3 と同じくルールを先頭から評価します。preflight（`OPTIONS`）はバケット・オブジェクトのどちらのパスでも受け付け、許可リストの判定は行いません（ブラウザは presigned URL のクエリをそのまま付けて preflight を送るため）。実リクエストは `Origin` があり、オリジンとメソッドが一致するルールがあれば、成功・失敗にかかわらず `Access-Control-*` を付けます。
+
+### ライフサイクル
+
+ルールはバケットの行に JSON で持ちます。`apply_lifecycle(now_ms)` は時刻を引数に取る同期処理で、バケットごとに1トランザクションでルールを適用します。時刻を注入できるため、テストは「作成から N 日後」を sleep なしで決定的に確認できます。HTTP サーバーは `LS2_LIFECYCLE_INTERVAL_SECONDS` ごとに現在時刻で呼び、`POST /_ls2/lifecycle?now=` は任意の時刻で呼びます。
+
+- 期限は S3 と同じく「作成時刻 + 日数」を翌日 0 時（UTC）に切り上げます。非現行バージョンの経過日数は、次のバージョンが作られた（非現行になった）時刻から数えます。
+- 現行バージョンの期限切れは、バージョニングなしなら削除、ありなら削除マーカーの追加です。`ExpiredObjectDeleteMarker` はほかのバージョンが残っていない削除マーカーだけを消します。
+- 削除は通常の DeleteObject と同じ内部処理を通るため、`is_latest` の更新とチャンクの削除も同じです。
+- `x-amz-expiration` は同じルール評価で、現行バージョンが期限切れになる日時とルール ID を返します。
+
+### 通知
+
+lqs と同じく、外部への送信を状態変更と分けます。イベントは書き込みと同じトランザクションで `notifications`（送信待ち）に入れます。書き込みがロールバックされればイベントも残らず、送信に失敗しても書き込みは取り消されません。HTTP サーバーの送信タスクは書き込みのたびに起こされ（ほかは 0.5 秒ごと）、送信待ちを id 順に `SendMessage` します。キュー URL は `GetQueueUrl` で解決してキャッシュします。
+
+- 失敗は `attempts` を増やし、`min(0.5 秒 × 2^attempts, 60 秒)` 後に再試行します。10回失敗したら `failed` にして残し、`/_ls2/status` で見えるようにします。
+- 再試行待ちのイベントがあるキューには、後のイベントを先に送りません。キューごとの順序が入れ替わらないためです（諦めたイベントは順序から外れます）。
+- イベント本文は作成時に組み立てて保存します。設定を後から変えても、記録済みのイベントは変わりません。`sequencer` は単調増加のカウンターです。
+- 送信クライアントは hyper の HTTP/1.1 クライアントだけで書き、SQS の JSON プロトコル（`X-Amz-Target: AmazonSQS.*`）を使います。TLS と署名は扱いません（lqs はローカル用で署名を検証しないため）。
+- 設定の検証は S3 に合わせます。存在しないイベント名・重複するフィルター・FIFO キューは `InvalidArgument`、S3 では有効でも LS2 が作らないイベント（復元・レプリケーションなど）は 501 です。
+
+v3 → v4 は列とテーブルの追加だけです。
 
 ## 一覧
 
@@ -93,9 +116,8 @@ les のメール閲覧と同じく、サーバー側で HTML を組み立てま�
 
 ## テスト
 
-`tests/simulator.rs` はコア（バケット、Range、整合性エラー時に保存されないこと、条件付きリクエスト、common prefix をまたぐページング、コピー、マルチパートの各エラー、DB 再オープン）と HTTP（aws-chunked + トレーラー、エラー XML、501、一覧 XML、DeleteObjects、マルチパート）を確認します。時刻を注入するので sleep はありません。`integration/aws-cli.sh` は実際の AWS CLI で、20 MiB のマルチパートアップロード・分割ダウンロード・UploadPartCopy・sync・virtual-hosted style・閲覧画面を確認します。`integration/s3_test.go` は AWS SDK for Go v2 で同じシナリオを path-style と virtual-hosted style の両方で実行します。CI はこれらを AWS CLI v2 で実行し、Docker イメージもビルドします。
+`tests/lifecycle_notifications.rs` はライフサイクル（日数・日付・タグ・サイズ、非現行バージョン、削除マーカー、未完了アップロード）と通知（検証、イベント本文、再試行と順序）をコアで確認し、HTTP では XML の往復、501、`/_ls2/lifecycle`、偽の SQS サーバーへの送信と再試行を確認します。`tests/simulator.rs` はコア（バケット、Range、整合性エラー時に保存されないこと、条件付きリクエスト、common prefix をまたぐページング、コピー、マルチパートの各エラー、DB 再オープン）と HTTP（aws-chunked + トレーラー、エラー XML、501、一覧 XML、DeleteObjects、マルチパート）を確認します。コアのテストは時刻を注入するので sleep はありません。`integration/aws-cli.sh` は実際の AWS CLI で、20 MiB のマルチパートアップロード・分割ダウンロード・UploadPartCopy・sync・virtual-hosted style・閲覧画面を確認します。`integration/s3_test.go` は AWS SDK for Go v2 で同じシナリオを path-style と virtual-hosted style の両方で実行し、`integration/notification_test.go` は実際の lqs へ通知が届くこと（ライフサイクルによる削除のイベントを含む）を確認します。CI は lqs をソースからビルドしてこれらを実行し、AWS CLI v2 と Docker イメージのビルドも確認します。
 
 ## 今後の拡張
 
-- **P3**: ライフサイクルによる期限切れ削除（注入した時刻で決定的にテスト）、lqs へのイベント通知（S3 → SQS）。
 - マルチパートの完成オブジェクトに FULL_OBJECT / COMPOSITE チェックサムを付けることも検討対象です。

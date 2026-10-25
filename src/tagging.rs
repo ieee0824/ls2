@@ -1,4 +1,5 @@
 //! Object and bucket tags.
+use crate::notification::{EventObject, Principal, emit};
 use crate::{Error, Ls2, from_json, require_bucket, resolve_object, to_json, validate_key};
 use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -84,6 +85,19 @@ impl Ls2 {
         key: &str,
         version_id: Option<&str>,
         tags: Tags,
+        now_ms: i64,
+    ) -> Result<String, Error> {
+        self.set_object_tags(bucket, key, version_id, tags, "ObjectTagging:Put", now_ms)
+    }
+
+    fn set_object_tags(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        tags: Tags,
+        event: &str,
+        now_ms: i64,
     ) -> Result<String, Error> {
         validate_key(key)?;
         let tx = self.write_tx()?;
@@ -92,6 +106,13 @@ impl Ls2 {
             "UPDATE objects SET tags=?2 WHERE id=?1",
             params![id, tags_json(&tags)],
         )?;
+        let object = EventObject {
+            key,
+            size: None,
+            etag: Some(&info.etag),
+            version_id: Some(&info.version_id),
+        };
+        emit(&tx, bucket, event, &object, Principal::Request, now_ms)?;
         tx.commit()?;
         Ok(info.version_id)
     }
@@ -113,8 +134,10 @@ impl Ls2 {
         bucket: &str,
         key: &str,
         version_id: Option<&str>,
+        now_ms: i64,
     ) -> Result<String, Error> {
-        self.put_object_tagging(bucket, key, version_id, Tags::new())
+        let event = "ObjectTagging:Delete";
+        self.set_object_tags(bucket, key, version_id, Tags::new(), event, now_ms)
     }
 
     pub fn put_bucket_tagging(&mut self, bucket: &str, tags: Tags) -> Result<(), Error> {

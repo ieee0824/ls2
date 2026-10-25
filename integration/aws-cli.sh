@@ -85,6 +85,21 @@ allow_origin=$(curl --fail --silent -o /dev/null -X OPTIONS -w '%header{access-c
   -H 'Origin: http://localhost:3000' -H 'Access-Control-Request-Method: GET' "$endpoint/$bucket/sha.txt")
 [ "$allow_origin" = "http://localhost:3000" ]
 
+step "lifecycle"
+s3 s3api put-bucket-lifecycle-configuration --bucket "$bucket" --lifecycle-configuration \
+  '{"Rules":[{"ID":"tmp","Status":"Enabled","Filter":{"Prefix":"tmp/"},"Expiration":{"Days":1}}]}'
+rule_id=$(s3 s3api get-bucket-lifecycle-configuration --bucket "$bucket" --query 'Rules[0].ID' --output text)
+[ "$rule_id" = tmp ]
+s3 s3 cp --only-show-errors "$work/small.txt" "s3://$bucket/tmp/expiring.txt"
+expiration=$(s3 s3api head-object --bucket "$bucket" --key tmp/expiring.txt --query Expiration --output text)
+grep -q 'rule-id="tmp"' <<<"$expiration"
+curl --fail --silent -X POST "$endpoint/_ls2/lifecycle?now=2999-01-01T00:00:00Z" >/dev/null
+if s3 s3api head-object --bucket "$bucket" --key tmp/expiring.txt >/dev/null 2>&1; then
+  echo "expected the lifecycle rule to expire tmp/expiring.txt" >&2
+  exit 1
+fi
+s3 s3api delete-bucket-lifecycle --bucket "$bucket"
+
 step "versioning"
 s3 s3api put-bucket-versioning --bucket "$bucket" --versioning-configuration Status=Enabled
 printf 'v1' >"$work/v1.txt"

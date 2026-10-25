@@ -38,10 +38,28 @@ async fn main() {
             .split(',')
             .map(str::to_owned)
             .collect(),
+        sqs_endpoint: std::env::var("LS2_SQS_ENDPOINT")
+            .ok()
+            .filter(|v| !v.is_empty()),
+        lifecycle_interval: match env("LS2_LIFECYCLE_INTERVAL_SECONDS", "60").parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            Err(e) => {
+                eprintln!("invalid LS2_LIFECYCLE_INTERVAL_SECONDS: {e}");
+                std::process::exit(2);
+            }
+        },
     };
+    if let Some(sqs) = &config.sqs_endpoint {
+        eprintln!("event notifications: {sqs}");
+    }
+    let router = ls2::server::try_router_with_config(ls2, config).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
     eprintln!("ls2 listening on http://{addr} (database: {path})");
     eprintln!("browse: http://{addr}/_ls2/browse");
-    axum::serve(listener, ls2::server::router_with_config(ls2, config))
+    axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

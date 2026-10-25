@@ -1,5 +1,7 @@
 //! S3 REST/XML adapter (path-style and virtual-hosted style). SigV4 is accepted but not verified.
 mod browse;
+mod lifecycle;
+mod notify;
 
 use crate::checksum::{Checksum, ChecksumAlgorithm, ChecksumInput};
 use crate::{
@@ -44,12 +46,20 @@ pub struct Config {
     /// Hosts of the form `<bucket>.<domain>` are virtual-hosted style requests.
     /// Any other host (an IP address, `localhost`, a container name) uses path-style.
     pub virtual_host_domains: Vec<String>,
+    /// `http://host:port` of an SQS-compatible endpoint (lqs) that receives bucket
+    /// event notifications. Without it, notification configurations are refused.
+    pub sqs_endpoint: Option<String>,
+    /// How often lifecycle rules run. `None` runs them only on
+    /// `POST /_ls2/lifecycle`.
+    pub lifecycle_interval: Option<Duration>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             virtual_host_domains: vec!["localhost".into()],
+            sqs_endpoint: None,
+            lifecycle_interval: None,
         }
     }
 }
@@ -57,6 +67,9 @@ impl Default for Config {
 struct AppState {
     ls2: Mutex<Ls2>,
     domains: Vec<String>,
+    sqs: Option<Arc<notify::SqsClient>>,
+    /// Wakes the notification worker after a write.
+    wake: tokio::sync::Notify,
 }
 
 type Shared = Arc<AppState>;
@@ -65,20 +78,64 @@ pub fn router(ls2: Ls2) -> Router {
     router_with_config(ls2, Config::default())
 }
 
+/// Panics on an invalid configuration; see [`try_router_with_config`].
 pub fn router_with_config(ls2: Ls2, config: Config) -> Router {
+    try_router_with_config(ls2, config).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Builds the router. The notification and lifecycle workers start on the current
+/// Tokio runtime, so call this from within one.
+pub fn try_router_with_config(ls2: Ls2, config: Config) -> Result<Router, String> {
     let domains = config
         .virtual_host_domains
         .iter()
         .map(|d| d.trim().trim_matches('.').to_ascii_lowercase())
         .filter(|d| !d.is_empty())
         .collect();
-    Router::new()
+    let sqs = config
+        .sqs_endpoint
+        .as_deref()
+        .map(notify::SqsClient::new)
+        .transpose()?
+        .map(Arc::new);
+    let state = Arc::new(AppState {
+        ls2: Mutex::new(ls2),
+        domains,
+        sqs,
+        wake: tokio::sync::Notify::new(),
+    });
+    let runtime = tokio::runtime::Handle::try_current();
+    if state.sqs.is_some() || config.lifecycle_interval.is_some() {
+        let runtime = runtime.map_err(|_| "background workers need a Tokio runtime".to_owned())?;
+        if state.sqs.is_some() {
+            runtime.spawn(notify::delivery_loop(state.clone()));
+        }
+        if let Some(every) = config.lifecycle_interval {
+            runtime.spawn(lifecycle_loop(state.clone(), every));
+        }
+    }
+    Ok(Router::new()
         .fallback(handle)
         .layer(DefaultBodyLimit::disable())
-        .with_state(Arc::new(AppState {
-            ls2: Mutex::new(ls2),
-            domains,
-        }))
+        .with_state(state))
+}
+
+/// Runs lifecycle rules every `every`, the way S3 applies them in the background.
+async fn lifecycle_loop(state: Shared, every: Duration) {
+    let mut ticks = tokio::time::interval(every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let run = lock(&state).and_then(|mut s| Ok(s.apply_lifecycle(now())?));
+        match run {
+            Ok(run) if run != crate::LifecycleRun::default() => {
+                eprintln!("lifecycle: {run:?}");
+                state.wake.notify_one();
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("lifecycle: {}", e.message),
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -848,7 +905,11 @@ async fn handle(
     let host_bucket = virtual_host_bucket(&state.domains, host);
     // LS2's own pages; bucket names cannot start with `_`, so path-style keys never collide.
     if host_bucket.is_none() && (uri.path() == "/_ls2" || uri.path().starts_with("/_ls2/")) {
-        return browse::handle(&state, &method, &uri);
+        let response = browse::handle(&state, &method, &uri, &headers);
+        if method == Method::POST {
+            state.wake.notify_one();
+        }
+        return response;
     }
     let mut target = parse_target(&uri, host_bucket);
     if let Ok(t) = &mut target {
@@ -884,6 +945,22 @@ async fn handle(
             .await
             .map_err(|_| too_large())?;
         let payload = parse_payload(&headers, body)?;
+        if method == Method::PUT
+            && target.key.is_none()
+            && target.has("notification")
+            && let Some(bucket) = &target.bucket
+        {
+            // Destinations are checked before the configuration is stored, as S3 does.
+            lock(&state)?.bucket(bucket)?;
+            let configs = notify::parse_notification(&payload.data)?;
+            crate::notification::validate(&configs)?;
+            let skip = headers
+                .get("x-amz-skip-destination-validation")
+                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"));
+            if !skip {
+                notify::check_destinations(&state, &configs).await?;
+            }
+        }
         let req = Req {
             target: target.clone(),
             headers: &headers,
@@ -895,6 +972,9 @@ async fn handle(
         dispatch(&mut ls2, &method, &req)
     }
     .await;
+    if !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        state.wake.notify_one();
+    }
     let mut response = match result {
         Ok(r) => r,
         Err(e) => error_response(e, target.as_ref().ok(), &request_id, head),
@@ -1044,6 +1124,64 @@ fn bucket_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Erro
             ls2.delete_bucket_cors(bucket)?;
             Ok(StatusCode::NO_CONTENT.into_response())
         }
+        Method::GET if r.has("lifecycle") => {
+            r.allow(&["lifecycle"], &[], false)?;
+            let rules = ls2.get_bucket_lifecycle(bucket)?.ok_or_else(|| {
+                s3err(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchLifecycleConfiguration",
+                    "The lifecycle configuration does not exist",
+                )
+            })?;
+            let mut response = xml_response(xml_doc(
+                "LifecycleConfiguration",
+                &lifecycle::lifecycle_xml(&rules),
+            ));
+            response.headers_mut().insert(
+                "x-amz-transition-default-minimum-object-size",
+                HeaderValue::from_static(lifecycle::TRANSITION_MINIMUM),
+            );
+            Ok(response)
+        }
+        Method::PUT if r.has("lifecycle") => {
+            r.allow(
+                &["lifecycle"],
+                &["x-amz-transition-default-minimum-object-size"],
+                false,
+            )?;
+            r.payload.verify()?;
+            ls2.put_bucket_lifecycle(bucket, lifecycle::parse_lifecycle(&r.payload.data)?)?;
+            let mut response = StatusCode::OK.into_response();
+            response.headers_mut().insert(
+                "x-amz-transition-default-minimum-object-size",
+                HeaderValue::from_static(lifecycle::TRANSITION_MINIMUM),
+            );
+            Ok(response)
+        }
+        Method::DELETE if r.has("lifecycle") => {
+            r.allow(&["lifecycle"], &[], false)?;
+            ls2.delete_bucket_lifecycle(bucket)?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        Method::GET if r.has("notification") => {
+            r.allow(&["notification"], &[], false)?;
+            let configs = ls2.get_bucket_notification(bucket)?;
+            Ok(xml_response(xml_doc(
+                "NotificationConfiguration",
+                &notify::notification_xml(&configs),
+            )))
+        }
+        Method::PUT if r.has("notification") => {
+            r.allow(
+                &["notification"],
+                &["x-amz-skip-destination-validation"],
+                false,
+            )?;
+            r.payload.verify()?;
+            let configs = notify::parse_notification(&r.payload.data)?;
+            ls2.put_bucket_notification(bucket, configs, r.now_ms)?;
+            Ok(StatusCode::OK.into_response())
+        }
         Method::GET if r.has("uploads") => list_uploads(ls2, r),
         Method::GET if r.has("list-type") => list_objects_v2(ls2, r),
         Method::GET => list_objects_v1(ls2, r),
@@ -1086,7 +1224,8 @@ fn object_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Erro
             r.allow(&["tagging", "versionId"], &[], false)?;
             r.payload.verify()?;
             let tags = parse_tagging(&r.payload.data, MAX_OBJECT_TAGS)?;
-            let version = ls2.put_object_tagging(r.bucket(), r.key(), r.version_id(), tags)?;
+            let version =
+                ls2.put_object_tagging(r.bucket(), r.key(), r.version_id(), tags, r.now_ms)?;
             let mut response = StatusCode::OK.into_response();
             version_header(
                 ls2,
@@ -1099,7 +1238,8 @@ fn object_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Erro
         }
         Method::DELETE if r.has("tagging") => {
             r.allow(&["tagging", "versionId"], &[], false)?;
-            let version = ls2.delete_object_tagging(r.bucket(), r.key(), r.version_id())?;
+            let version =
+                ls2.delete_object_tagging(r.bucket(), r.key(), r.version_id(), r.now_ms)?;
             let mut response = StatusCode::NO_CONTENT.into_response();
             version_header(
                 ls2,
@@ -1611,6 +1751,7 @@ fn put_object(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
     h.insert(header::ETAG, header_value(&quoted(&info.etag))?);
     checksum_headers(h, info.checksum.as_ref())?;
     version_header(ls2, h, r.bucket(), "x-amz-version-id", &info.version_id)?;
+    lifecycle::expiration_header(ls2, h, &info)?;
     Ok(response)
 }
 
@@ -1689,6 +1830,9 @@ fn get_object(ls2: &mut Ls2, r: &Req, head: bool) -> Result<Response, S3Error> {
     version_header(ls2, h, r.bucket(), "x-amz-version-id", &info.version_id)?;
     if !info.tags.is_empty() {
         h.insert("x-amz-tagging-count", HeaderValue::from(info.tags.len()));
+    }
+    if r.version_id().is_none() {
+        lifecycle::expiration_header(ls2, h, &info)?;
     }
     if let Some(parts) = info.etag.split_once('-').map(|(_, n)| n) {
         h.insert("x-amz-mp-parts-count", header_value(parts)?);

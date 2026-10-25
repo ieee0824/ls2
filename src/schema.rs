@@ -3,7 +3,7 @@ use crate::Error;
 use rusqlite::Connection;
 
 /// Version written by this build. Newer databases are refused.
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 /// Latest schema, used for new databases.
 const CREATE: &str = "
@@ -13,7 +13,9 @@ CREATE TABLE buckets (
     created_at_ms INTEGER NOT NULL,
     versioning TEXT,
     tags TEXT,
-    cors TEXT);
+    cors TEXT,
+    lifecycle TEXT,
+    notification TEXT);
 CREATE TABLE objects (
     id INTEGER PRIMARY KEY,
     bucket TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
@@ -55,6 +57,18 @@ CREATE TABLE parts (
     checksum TEXT,
     data BLOB NOT NULL,
     PRIMARY KEY (upload_id, part_number));
+CREATE TABLE notifications (
+    id INTEGER PRIMARY KEY,
+    queue_arn TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_ms INTEGER NOT NULL,
+    last_error TEXT,
+    failed INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX notifications_due ON notifications (failed, next_attempt_ms, id);
+CREATE INDEX notifications_queue ON notifications (queue_arn, id) WHERE failed = 0;
+CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 ";
 
 /// 1 → 2: object versions. `UNIQUE(bucket, key)` becomes `UNIQUE(bucket, key, version_id)`,
@@ -93,8 +107,27 @@ ALTER TABLE buckets ADD COLUMN tags TEXT;
 ALTER TABLE buckets ADD COLUMN cors TEXT;
 ";
 
+/// 3 → 4: lifecycle and notification configuration, the notification outbox and
+/// the event sequencer.
+const V4: &str = "
+ALTER TABLE buckets ADD COLUMN lifecycle TEXT;
+ALTER TABLE buckets ADD COLUMN notification TEXT;
+CREATE TABLE notifications (
+    id INTEGER PRIMARY KEY,
+    queue_arn TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_ms INTEGER NOT NULL,
+    last_error TEXT,
+    failed INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX notifications_due ON notifications (failed, next_attempt_ms, id);
+CREATE INDEX notifications_queue ON notifications (queue_arn, id) WHERE failed = 0;
+CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+";
+
 /// `(target version, SQL)` applied in order to reach [`SCHEMA_VERSION`].
-const MIGRATIONS: &[(i64, &str)] = &[(2, V2), (3, V3)];
+const MIGRATIONS: &[(i64, &str)] = &[(2, V2), (3, V3), (4, V4)];
 
 pub(crate) fn init(conn: &mut Connection) -> Result<(), Error> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;

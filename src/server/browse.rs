@@ -5,7 +5,7 @@ use crate::{Error, ListRequest, ObjectInfo, ReadCondition, VersionListRequest};
 use axum::{
     Json,
     body::Body,
-    http::{HeaderValue, Method, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use percent_encoding::{percent_decode_str, utf8_percent_encode};
@@ -16,7 +16,10 @@ const PAGE_SIZE: usize = 200;
 const PREVIEW_BYTES: usize = 64 * 1024;
 const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-pub(super) fn handle(state: &Shared, method: &Method, uri: &Uri) -> Response {
+pub(super) fn handle(state: &Shared, method: &Method, uri: &Uri, headers: &HeaderMap) -> Response {
+    if uri.path() == "/_ls2/lifecycle" {
+        return run_lifecycle(state, method, uri, headers);
+    }
     if *method != Method::GET && *method != Method::HEAD {
         return (StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
     }
@@ -97,8 +100,55 @@ impl From<crate::Error> for Page {
 }
 
 fn status(state: &Shared) -> Result<Response, Page> {
-    let buckets = lock(state)?.stats()?;
-    Ok(Json(serde_json::json!({ "buckets": buckets })).into_response())
+    let ls2 = lock(state)?;
+    let buckets = ls2.stats()?;
+    let notifications = ls2.notification_stats()?;
+    Ok(Json(serde_json::json!({
+        "buckets": buckets,
+        "notifications": notifications,
+        "sqsEndpoint": state.sqs.is_some(),
+    }))
+    .into_response())
+}
+
+/// `POST /_ls2/lifecycle[?now=<Unix ms | ISO 8601>]`: applies lifecycle rules as of
+/// `now` (default: the current time), so tests need not wait for days to pass.
+fn run_lifecycle(state: &Shared, method: &Method, uri: &Uri, headers: &HeaderMap) -> Response {
+    let plain = |status: StatusCode, message: &str| (status, message.to_owned()).into_response();
+    if *method != Method::POST {
+        return plain(StatusCode::METHOD_NOT_ALLOWED, "use POST");
+    }
+    // Browsers attach Origin to cross-site POSTs; refuse them so a web page cannot
+    // expire local data.
+    if headers.contains_key(header::ORIGIN) {
+        return plain(
+            StatusCode::FORBIDDEN,
+            "cross-origin requests are not allowed",
+        );
+    }
+    let query: Vec<(String, String)> =
+        serde_urlencoded::from_str(uri.query().unwrap_or_default()).unwrap_or_default();
+    let now_ms = match query
+        .iter()
+        .find(|(k, _)| k == "now")
+        .map(|(_, v)| v.as_str())
+    {
+        None => super::now(),
+        Some(v) => match v.parse::<i64>().ok().or_else(|| crate::parse_iso8601(v)) {
+            Some(ms) => ms,
+            None => {
+                return plain(
+                    StatusCode::BAD_REQUEST,
+                    "now must be Unix milliseconds or an ISO 8601 UTC time",
+                );
+            }
+        },
+    };
+    let run = lock(state).and_then(|mut s| Ok(s.apply_lifecycle(now_ms)?));
+    match run {
+        Ok(run) => Json(run).into_response(),
+        Err(e) => plain(e.status, &e.message),
+    }
 }
 
 // ---- links and formatting ----
