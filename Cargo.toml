@@ -2,5 +2,25 @@
 name = "ls2"
 version = "0.1.0"
 edition = "2024"
+description = "SQLite-backed local Amazon S3 simulator"
 
 [dependencies]
+axum = "0.8"
+base64 = "0.22"
+crc = "3"
+httpdate = "1"
+md-5 = "0.10"
+percent-encoding = "2"
+quick-xml = { version = "0.38", features = ["serialize"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
