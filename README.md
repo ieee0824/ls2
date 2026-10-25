@@ -18,6 +18,7 @@ cargo run --locked
 | `LS2_BIND_ADDR` | `127.0.0.1:9326` | HTTP 待ち受けアドレス |
 | `LS2_DATABASE_PATH` | `ls2.sqlite` | SQLite ファイル |
 | `LS2_ALLOW_UNAUTHENTICATED_REMOTE` | `false` | `true` で loopback 以外への bind を許可（認証なしで公開されます） |
+| `LS2_VIRTUAL_HOST_DOMAINS` | `localhost` | virtual-hosted style として扱うドメイン（カンマ区切り）。`<bucket>.<domain>` の Host をバケットとみなします |
 
 既定では loopback でのみ起動します。停止・再起動後もデータは残ります。
 
@@ -26,9 +27,25 @@ curl --fail http://127.0.0.1:9326/_ls2/health
 curl --fail http://127.0.0.1:9326/_ls2/status   # バケットごとのオブジェクト数・サイズ・未完了アップロード数
 ```
 
+### Docker
+
+```sh
+docker build -t ls2 .
+docker run --rm -p 127.0.0.1:9326:9326 -v ls2-data:/data ls2
+```
+
+イメージは `LS2_BIND_ADDR=0.0.0.0:9326`・`LS2_ALLOW_UNAUTHENTICATED_REMOTE=true`・`LS2_DATABASE_PATH=/data/ls2.sqlite` で起動します。認証がないため、ポートは `127.0.0.1` に限定して公開してください。データはボリューム `/data` に残ります。
+
+## 閲覧画面
+
+ブラウザで `http://127.0.0.1:9326/_ls2/browse` を開くと、バケット一覧 → フォルダ（`/` 区切りの prefix）→ オブジェクト詳細の順にたどれます。詳細画面ではサイズ・ETag・チェックサム・メタデータ・UTF-8 テキストの先頭 64 KiB を表示し、ダウンロードできます。
+
+- 読み取り専用です。表示する値はすべて HTML エスケープし、CSP でスクリプトを禁止しています。
+- ダウンロードは常に `attachment`（`application/octet-stream`、`nosniff`）で返すため、保存された HTML や SVG がブラウザで実行されることはありません。
+
 ## AWS CLI / SDK
 
-エンドポイントを `http://127.0.0.1:9326` に変え、リージョンとダミーの認証情報を設定します。**path-style アドレッシング**（`http://host/bucket/key`）のみ対応です。
+エンドポイントを `http://127.0.0.1:9326`（path-style）または `http://localhost:9326`（virtual-hosted style 可）に変え、リージョンとダミーの認証情報を設定します。
 
 ```sh
 export AWS_ACCESS_KEY_ID=test
@@ -47,7 +64,9 @@ aws --endpoint-url http://127.0.0.1:9326 s3 ls --recursive s3://my-bucket
 | AWS SDK for JavaScript v3 | `endpoint: "http://127.0.0.1:9326"`、`forcePathStyle: true` |
 | AWS SDK for Java v2 | `endpointOverride(URI.create(...))`、`forcePathStyle(true)` |
 
-署名付き URL（presigned URL）は署名を検証せずに受け付けます。
+**virtual-hosted style**: エンドポイントを `http://localhost:9326` にすると、SDK は `http://<bucket>.localhost:9326/<key>` に送ります（Go v2 は `UsePathStyle = false`）。`*.localhost` を 127.0.0.1 に解決しない環境では、hosts への追加か、HTTP クライアント側で接続先を 127.0.0.1 に固定してください（`integration/s3_test.go` を参照）。ほかのホスト名で使う場合は `LS2_VIRTUAL_HOST_DOMAINS` に追加します。IP アドレスや `localhost` そのもの、未登録のホスト名（Docker のサービス名など）は path-style として扱います。
+
+署名付き URL（presigned URL）は署名を検証せずに受け付けます。SDK がクエリに移した `X-Amz-*` ヘッダー（`X-Amz-Checksum-Mode` など）はヘッダーとして扱います。
 
 ## 対応範囲
 
@@ -58,7 +77,7 @@ aws --endpoint-url http://127.0.0.1:9326 s3 ls --recursive s3://my-bucket
 | 一覧 | `ListObjectsV2` / `ListObjects`（prefix・delimiter・ページング・`encoding-type=url`） |
 | マルチパート | `CreateMultipartUpload` / `UploadPart` / `UploadPartCopy` / `CompleteMultipartUpload` / `AbortMultipartUpload` / `ListParts` / `ListMultipartUploads` |
 | タグ | `GetObjectTagging`（常に空。タグの設定は未対応） |
-| LS2 独自 | `GET /_ls2/health`、`GET /_ls2/status` |
+| LS2 独自 | `GET /_ls2/health`、`GET /_ls2/status`、`GET /_ls2/browse`（閲覧画面） |
 
 - **Range**: `bytes=a-b` / `bytes=a-` / `bytes=-n`。範囲外は 416 `InvalidRange`。複数範囲は 501。
 - **条件付きリクエスト**: GET/HEAD の `If-Match` / `If-None-Match` / `If-Modified-Since` / `If-Unmodified-Since`、書き込みの `If-None-Match: *` / `If-Match`、コピー元の `x-amz-copy-source-if-*`。
@@ -68,9 +87,10 @@ aws --endpoint-url http://127.0.0.1:9326 s3 ls --recursive s3://my-bucket
 
 ## 制約
 
-**未対応の機能は黙って無視せず `501 NotImplemented` を返します。** 例: バージョニングの有効化、ACL・ポリシー、タグ設定、SSE、Object Lock、`STANDARD` 以外のストレージクラス、ライフサイクル、CORS、通知、virtual-hosted style、`partNumber` 指定の GET。許可リストにない `x-amz-*` ヘッダーやクエリパラメーターも 501 になるため、ローカルでは成功したのに本番では意味が違う、というケースを減らせます。
+**未対応の機能は黙って無視せず `501 NotImplemented` を返します。** 例: バージョニングの有効化、ACL・ポリシー、タグ設定、SSE、Object Lock、`STANDARD` 以外のストレージクラス、ライフサイクル、CORS、通知、`partNumber` 指定の GET。許可リストにない `x-amz-*` ヘッダーやクエリパラメーターも 501 になるため、ローカルでは成功したのに本番では意味が違う、というケースを減らせます。
 
-- 1リクエストの本文は 256 MiB まで（超過は `EntityTooLarge`）。それより大きいオブジェクトはマルチパートで作成します。GET はレスポンス範囲をメモリに読み込みます。
+- 1リクエストの本文は 256 MiB まで（超過は `EntityTooLarge`）。それより大きいオブジェクトはマルチパートで作成します。
+- GET は 1 MiB ずつ読み出してストリーミングします。ダウンロード中にオブジェクトが上書き・削除されると、古い内容と新しい内容を混ぜずに接続を打ち切ります（クライアントは短い本文として再試行します）。
 - マルチパートは S3 と同じく最後以外のパートが 5 MiB 以上、パート番号 1〜10000 です。完成したオブジェクトにはオブジェクト単位のチェックサムを付けません（パート単位では検証します）。
 - CopyObject はコピー元の ETag とチェックサムを引き継ぎます（S3 ではマルチパート由来の ETag が変わる場合があります）。
 - us-east-1 のバケットを再作成すると成功し、ほかのリージョンでは `BucketAlreadyOwnedByYou` になります（S3 の挙動に合わせています）。`DeleteBucket` は未完了のマルチパートアップロードを一緒に破棄します。
@@ -98,8 +118,11 @@ assert_eq!((out.data.as_slice(), out.info.etag), (&b"hello"[..], info.etag));
 cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-# 別ターミナルで LS2 を起動した状態で実行（AWS CLI が必要）
-bash integration/aws-cli.sh
+# 別ターミナルで LS2 を起動した状態で実行
+bash integration/aws-cli.sh              # AWS CLI
+(cd integration && go test ./...)        # AWS SDK for Go v2（path-style と virtual-hosted style）
 ```
+
+GitHub Actions では上記に加えて AWS CLI v2 と Docker イメージのビルドを確認します。
 
 設計・拡張方針は [DESIGN.md](DESIGN.md) を参照してください。

@@ -58,6 +58,16 @@ grep -q '"color": "blue"' <<<"$head_json"
 s3 s3api get-object --bucket "$bucket" --key sha.txt --checksum-mode ENABLED "$work/sha.out" >/dev/null
 cmp "$work/small.txt" "$work/sha.out"
 
+step "virtual-hosted style and browser"
+port=${endpoint##*:}
+vhost_body=$(curl --fail --silent --resolve "$bucket.localhost:$port:127.0.0.1" \
+  "http://$bucket.localhost:$port/dir/small.txt")
+[ "$vhost_body" = "hello ls2" ]
+page=$(curl --fail --silent "$endpoint/_ls2/browse/$bucket?prefix=dir%2F")
+grep -q 'small.txt' <<<"$page"
+curl --fail --silent -o "$work/download.out" "$endpoint/_ls2/download/$bucket?key=dir%2Fsmall.txt"
+cmp "$work/small.txt" "$work/download.out"
+
 step "conditional write"
 if s3 s3api put-object --bucket "$bucket" --key sha.txt --body "$work/small.txt" --if-none-match '*' 2>/dev/null; then
   echo "expected PreconditionFailed" >&2

@@ -238,6 +238,18 @@ pub struct GetOutput {
     pub range: Option<(u64, u64)>,
 }
 
+/// A located object for incremental reads (see [`Ls2::read_object`]).
+#[derive(Debug, Clone)]
+pub struct ObjectHandle {
+    pub info: ObjectInfo,
+    /// Half-open byte range to send: the applied Range, or the whole object.
+    pub start: u64,
+    pub end: u64,
+    /// Whether a Range header was applied.
+    pub partial: bool,
+    id: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ListRequest {
     pub prefix: String,
@@ -512,17 +524,50 @@ impl Ls2 {
         cond: &ReadCondition,
     ) -> Result<GetOutput, Error> {
         let tx = self.conn.unchecked_transaction()?;
-        require_bucket(&tx, bucket)?;
-        let (id, info) = load_object(&tx, bucket, key)?.ok_or(Error::NoSuchKey)?;
-        check_read_condition(&info, cond)?;
-        let resolved = range.map(|r| r.resolve(info.size)).transpose()?;
-        let (start, end) = resolved.unwrap_or((0, info.size));
-        let data = read_range(&tx, id, start, end)?;
+        let handle = open_object(&tx, bucket, key, range, cond)?;
+        let data = read_range(&tx, handle.id, handle.start, handle.end)?;
         Ok(GetOutput {
-            info,
+            range: handle.partial.then_some((handle.start, handle.end)),
+            info: handle.info,
             data,
-            range: resolved,
         })
+    }
+
+    /// Evaluates conditions and the range without reading the body.
+    /// Read the bytes later with [`Ls2::read_object`], piece by piece.
+    pub fn open_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<ByteRange>,
+        cond: &ReadCondition,
+    ) -> Result<ObjectHandle, Error> {
+        open_object(&self.conn, bucket, key, range, cond)
+    }
+
+    /// Reads `[offset, offset + len)` of the object behind `handle` (clamped to its size).
+    /// Fails if the object was replaced or deleted after `open_object`, so a long
+    /// download never mixes two versions.
+    pub fn read_object(
+        &self,
+        handle: &ObjectHandle,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let unchanged: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM objects WHERE id=?1 AND etag=?2 AND last_modified_ms=?3)",
+            params![handle.id, handle.info.etag, handle.info.last_modified_ms],
+            |r| r.get(0),
+        )?;
+        if !unchanged {
+            return Err(Error::InvalidRequest(
+                "The object was modified while it was being read".into(),
+            ));
+        }
+        let start = offset.min(handle.info.size);
+        let end = offset.saturating_add(len as u64).min(handle.info.size);
+        read_range(&tx, handle.id, start, end)
     }
 
     /// Deleting a missing key succeeds, as in S3.
@@ -857,22 +902,64 @@ pub(crate) fn etag_matches(header: &str, etag: &str) -> bool {
         .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t).trim_matches('"') == etag)
 }
 
+fn open_object(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    range: Option<ByteRange>,
+    cond: &ReadCondition,
+) -> Result<ObjectHandle, Error> {
+    require_bucket(conn, bucket)?;
+    let (id, info) = load_object(conn, bucket, key)?.ok_or(Error::NoSuchKey)?;
+    check_read_condition(&info, cond)?;
+    let resolved = range.map(|r| r.resolve(info.size)).transpose()?;
+    let (start, end) = resolved.unwrap_or((0, info.size));
+    Ok(ObjectHandle {
+        info,
+        start,
+        end,
+        partial: resolved.is_some(),
+        id,
+    })
+}
+
+/// Reads `[start, end)` with incremental BLOB I/O, so only the needed pages are loaded.
 pub(crate) fn read_range(
     conn: &Connection,
     object_id: i64,
     start: u64,
     end: u64,
 ) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity((end - start) as usize);
-    let mut stmt = conn.prepare(
-        "SELECT substr(data, max(?2, offset) - offset + 1, min(?3, offset + size) - max(?2, offset))
-         FROM chunks WHERE object_id = ?1 AND offset < ?3 AND offset + size > ?2 ORDER BY seq",
-    )?;
-    let mut rows = stmt.query(params![object_id, start as i64, end as i64])?;
-    while let Some(row) = rows.next()? {
-        out.extend_from_slice(row.get_ref(0)?.as_blob().map_err(rusqlite::Error::from)?);
+    let mut out = vec![0; (end - start) as usize];
+    if out.is_empty() {
+        return Ok(out);
     }
-    if out.len() as u64 != end - start {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, offset, size FROM chunks
+         WHERE object_id = ?1 AND offset < ?3 AND offset + size > ?2 ORDER BY seq",
+    )?;
+    let chunks = stmt
+        .query_map(params![object_id, start as i64, end as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, u64>(1)?,
+                r.get::<_, u64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut filled = 0u64;
+    for (rowid, offset, size) in chunks {
+        let from = start.max(offset);
+        let to = end.min(offset + size);
+        if from != start + filled {
+            break;
+        }
+        let blob = conn.blob_open(rusqlite::DatabaseName::Main, "chunks", "data", rowid, true)?;
+        let dst = &mut out[(from - start) as usize..(to - start) as usize];
+        blob.read_at_exact(dst, (from - offset) as usize)?;
+        filled += to - from;
+    }
+    if filled != end - start {
         return Err(Error::Storage(rusqlite::Error::InvalidQuery));
     }
     Ok(out)

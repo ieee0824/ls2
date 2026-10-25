@@ -9,7 +9,8 @@
 | `src/lib.rs` | バケット・オブジェクト・一覧・コピー・条件付きリクエストの同期コア |
 | `src/multipart.rs` | マルチパートアップロード（コアの続き） |
 | `src/checksum.rs` | MD5 とフレキシブルチェックサムの計算・検証 |
-| `src/server.rs` | S3 REST/XML の変換、`aws-chunked` の復号、許可リスト |
+| `src/server.rs` | S3 REST/XML の変換、virtual-hosted style の判定、`aws-chunked` の復号、許可リスト、GET のストリーミング |
+| `src/server/browse.rs` | `/_ls2/*`（health・status・閲覧画面・ダウンロード） |
 | `src/main.rs` | 環境変数・DB 接続・bind 制限・サーバー起動 |
 
 HTTP からも Rust からも同じ検証を通ります。HTTP は `Mutex` で1接続を直列に使い、WAL と5秒の busy timeout を設定します。
@@ -36,7 +37,11 @@ parts(upload_id, part_number, size, etag, last_modified_ms, checksum JSON, data 
 
 ## HTTP 層
 
-すべての S3 リクエストを1つの fallback ハンドラーで受け、生のパスを自前で `/{bucket}/{key}` に分けて percent-decode します。ルーターのパス正規化に任せないため、`//` を含むキーや末尾 `/` のキーもそのまま扱えます。独自 API は S3 のバケット名に使えない `_` で始まる `/_ls2/` に置き、`/health` のようなバケット名と衝突しません。
+すべてのリクエストを1つの fallback ハンドラーで受け、生のパスを自前で `/{bucket}/{key}` に分けて percent-decode します。ルーターのパス正規化に任せないため、`//` を含むキーや末尾 `/` のキーもそのまま扱えます。独自 API は S3 のバケット名に使えない `_` で始まる `/_ls2/` に置き、`/health` のようなバケット名と衝突しません。
+
+Host ヘッダーが `<bucket>.<LS2_VIRTUAL_HOST_DOMAINS のいずれか>` なら virtual-hosted style として、パス全体をキーにします。このときは `/_ls2/...` も通常のキーです（そのバケットに `_ls2/health` というキーを置けます）。それ以外の Host（IP、`localhost`、Docker のサービス名）は path-style です。判定後は同じ処理を通るため、両方式で挙動は変わりません。
+
+presigned URL では SDK が署名対象の `x-amz-*` ヘッダーをクエリへ移すことがあります（`X-Amz-Checksum-Mode` など）。署名用のクエリ以外の `X-Amz-*` クエリはヘッダーへ戻してから許可リストを適用します。
 
 本文は 256 MiB まで読み、次の順で処理します。
 
@@ -52,6 +57,16 @@ parts(upload_id, part_number, size, etag, last_modified_ms, checksum JSON, data 
 
 S3 自身が無視する入力（COPY 指定時のメタデータヘッダーなど）は S3 に合わせて無視します。
 
+### GET のストリーミング
+
+コアの `open_object` は条件と Range を評価してオブジェクトの位置を返し、`read_object` はその範囲を SQLite の incremental BLOB I/O で読みます。BLOB 全体を読み込まずに必要なページだけを読むため、256 MiB のチャンクの一部を読むときもメモリは読み出し量分で済みます。HTTP 層は最初の 1 MiB をリクエスト処理中に読み、残りは 1 MiB ごとにロックを取り直してストリーミングします。ロックをダウンロード全体で保持しないため、大きな GET の間もほかのリクエストが進みます。
+
+各読み出しでは、オブジェクト行の id・ETag・更新時刻が `open_object` 時点と同じかを確認し、上書き・削除されていればエラーで打ち切ります。id は再利用され得るため、ETag と更新時刻も比べます。
+
+## 閲覧画面
+
+les のメール閲覧と同じく、サーバー側で HTML を組み立てます。JavaScript は使わず、CSP は `default-src 'none'` とインライン CSS だけです。キー・メタデータ・プレビューはすべてエスケープします。ダウンロードは保存された Content-Type を使わず `application/octet-stream` の `attachment` にし、同じオリジンで利用者のデータが HTML として解釈されないようにしています。閲覧画面は読み取り専用で、状態を変える操作は S3 API だけです。
+
 ## 互換性の境界
 
 - ETag は単一 PUT が MD5、マルチパートが「各パート MD5 を連結した MD5」-パート数です。
@@ -62,10 +77,9 @@ S3 自身が無視する入力（COPY 指定時のメタデータヘッダーな
 
 ## テスト
 
-`tests/simulator.rs` はコア（バケット、Range、整合性エラー時に保存されないこと、条件付きリクエスト、common prefix をまたぐページング、コピー、マルチパートの各エラー、DB 再オープン）と HTTP（aws-chunked + トレーラー、エラー XML、501、一覧 XML、DeleteObjects、マルチパート）を確認します。時刻を注入するので sleep はありません。`integration/aws-cli.sh` は実際の AWS CLI で、20 MiB のマルチパートアップロード・分割ダウンロード・UploadPartCopy・sync を確認します。
+`tests/simulator.rs` はコア（バケット、Range、整合性エラー時に保存されないこと、条件付きリクエスト、common prefix をまたぐページング、コピー、マルチパートの各エラー、DB 再オープン）と HTTP（aws-chunked + トレーラー、エラー XML、501、一覧 XML、DeleteObjects、マルチパート）を確認します。時刻を注入するので sleep はありません。`integration/aws-cli.sh` は実際の AWS CLI で、20 MiB のマルチパートアップロード・分割ダウンロード・UploadPartCopy・sync・virtual-hosted style・閲覧画面を確認します。`integration/s3_test.go` は AWS SDK for Go v2 で同じシナリオを path-style と virtual-hosted style の両方で実行します。CI はこれらを AWS CLI v2 で実行し、Docker イメージもビルドします。
 
 ## 今後の拡張
 
-- **P2**: ブラウザでバケットとオブジェクトを閲覧する画面（les のメール閲覧と同様、サーバー側で HTML を生成）、virtual-hosted style（`<bucket>.localhost`）、Docker イメージ。
 - **P3**: バージョニング（`objects` に version 列を追加するマイグレーション）、オブジェクト/バケットのタグ、CORS（ブラウザから直接アップロードする開発用）、ライフサイクルによる期限切れ削除（注入した時刻で決定的にテスト）、lqs へのイベント通知（S3 → SQS）。
-- 大きなオブジェクトの GET をチャンク単位のストリーミングにすること、マルチパートの完成オブジェクトに FULL_OBJECT / COMPOSITE チェックサムを付けることも検討対象です。
+- マルチパートの完成オブジェクトに FULL_OBJECT / COMPOSITE チェックサムを付けることも検討対象です。
