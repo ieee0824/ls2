@@ -74,8 +74,27 @@ if s3 s3api put-object --bucket "$bucket" --key sha.txt --body "$work/small.txt"
   exit 1
 fi
 
+step "versioning"
+s3 s3api put-bucket-versioning --bucket "$bucket" --versioning-configuration Status=Enabled
+printf 'v1' >"$work/v1.txt"
+printf 'v2' >"$work/v2.txt"
+v1=$(s3 s3api put-object --bucket "$bucket" --key versioned.txt --body "$work/v1.txt" --query VersionId --output text)
+s3 s3api put-object --bucket "$bucket" --key versioned.txt --body "$work/v2.txt" >/dev/null
+s3 s3 rm --only-show-errors "s3://$bucket/versioned.txt"
+s3 s3api get-object --bucket "$bucket" --key versioned.txt --version-id "$v1" "$work/v1.out" >/dev/null
+cmp "$work/v1.txt" "$work/v1.out"
+versions=$(s3 s3api list-object-versions --bucket "$bucket" --prefix versioned.txt \
+  --query '[length(Versions), length(DeleteMarkers)]' --output text)
+[ "$(tr -s '[:space:]' ' ' <<<"$versions" | sed 's/ $//')" = "2 1" ]
+# Remove every version (and delete marker) so the bucket can be deleted.
+s3 s3api list-object-versions --bucket "$bucket" \
+  --query '{Objects: [Versions[].{Key: Key, VersionId: VersionId}, DeleteMarkers[].{Key: Key, VersionId: VersionId}][]}' \
+  --output json >"$work/delete.json"
+
 step "recursive delete and remove bucket"
-s3 s3 rm --only-show-errors --recursive "s3://$bucket" >/dev/null
+s3 s3api delete-objects --bucket "$bucket" --delete "file://$work/delete.json" >/dev/null
+remaining=$(s3 s3api list-object-versions --bucket "$bucket" --query 'length(Versions || `[]`)' --output text)
+[ "$remaining" = 0 ]
 s3 s3 rb "s3://$bucket"
 
 echo "OK"

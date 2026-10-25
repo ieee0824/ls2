@@ -3,8 +3,9 @@ mod browse;
 
 use crate::checksum::{Checksum, ChecksumAlgorithm, ChecksumInput};
 use crate::{
-    ByteRange, CompletedPart, Error, ListRequest, Ls2, MAX_LIST, Metadata, ObjectHandle,
-    ObjectInfo, PutOptions, ReadCondition, WriteCondition,
+    ByteRange, CompletedPart, CopySource, DeleteOutcome, Error, ListRequest, Ls2, MAX_LIST,
+    Metadata, ObjectHandle, ObjectId, ObjectInfo, PutOptions, ReadCondition, VersionListRequest,
+    Versioning, WriteCondition,
 };
 use axum::{
     Router,
@@ -149,6 +150,8 @@ struct S3Error {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// Extra response headers (e.g. `x-amz-delete-marker`).
+    headers: Vec<(&'static str, String)>,
 }
 
 fn s3err(status: StatusCode, code: &'static str, message: impl Into<String>) -> S3Error {
@@ -156,6 +159,7 @@ fn s3err(status: StatusCode, code: &'static str, message: impl Into<String>) -> 
         status,
         code,
         message: message.into(),
+        headers: Vec::new(),
     }
 }
 fn bad(code: &'static str, message: impl Into<String>) -> S3Error {
@@ -177,7 +181,16 @@ fn malformed_xml() -> S3Error {
 impl From<Error> for S3Error {
     fn from(e: Error) -> Self {
         let status = match &e {
-            Error::NoSuchBucket | Error::NoSuchKey | Error::NoSuchUpload => StatusCode::NOT_FOUND,
+            Error::NoSuchBucket
+            | Error::NoSuchKey
+            | Error::NoSuchUpload
+            | Error::NoSuchVersion
+            | Error::DeleteMarker {
+                requested: false, ..
+            } => StatusCode::NOT_FOUND,
+            Error::DeleteMarker {
+                requested: true, ..
+            } => StatusCode::METHOD_NOT_ALLOWED,
             Error::BucketAlreadyOwnedByYou | Error::BucketNotEmpty => StatusCode::CONFLICT,
             Error::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
             Error::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
@@ -193,16 +206,33 @@ impl From<Error> for S3Error {
             }
             other => other.to_string(),
         };
+        let mut headers = Vec::new();
+        if let Error::DeleteMarker {
+            version_id,
+            last_modified_ms,
+            requested,
+        } = &e
+        {
+            headers.push(("x-amz-delete-marker", "true".into()));
+            headers.push(("x-amz-version-id", version_id.clone()));
+            if *requested {
+                headers.push(("last-modified", http_date(*last_modified_ms)));
+            }
+        }
         S3Error {
             status,
             code: e.code(),
             message,
+            headers,
         }
     }
 }
 
 fn error_response(e: S3Error, r: Option<&Target>, request_id: &str, head: bool) -> Response {
     let mut builder = Response::builder().status(e.status);
+    for (name, value) in &e.headers {
+        builder = builder.header(*name, value);
+    }
     if head || e.status == StatusCode::NOT_MODIFIED {
         // HEAD and 304 responses carry no body; the code is exposed for debugging.
         builder = builder.header("x-amz-error-code", e.code);
@@ -215,6 +245,10 @@ fn error_response(e: S3Error, r: Option<&Target>, request_id: &str, head: bool) 
                 extra = tag("BucketName", t.bucket.as_deref().unwrap_or_default());
             }
             "NoSuchKey" => extra = tag("Key", t.key.as_deref().unwrap_or_default()),
+            "NoSuchVersion" => {
+                extra = tag("Key", t.key.as_deref().unwrap_or_default())
+                    + &tag("VersionId", t.query("versionId").unwrap_or_default());
+            }
             "NoSuchUpload" => {
                 extra = tag("UploadId", t.query("uploadId").unwrap_or_default());
             }
@@ -521,21 +555,34 @@ impl Req<'_> {
             if_unmodified_since_ms: date("if-unmodified-since"),
         }
     }
-    /// `x-amz-copy-source: [/]bucket/key` (URL-encoded).
-    fn copy_source(&self) -> Result<(String, String), S3Error> {
+    /// `x-amz-copy-source: [/]bucket/key[?versionId=id]` (URL-encoded).
+    fn copy_source(&self) -> Result<CopySource, S3Error> {
         let raw = self.header("x-amz-copy-source").unwrap_or_default();
         let (path, query) = raw.split_once('?').unwrap_or((raw, ""));
-        if !query.is_empty() {
-            return Err(not_implemented(
-                "Copying a specific version is not supported",
-            ));
+        let query: Vec<(String, String)> = serde_urlencoded::from_str(query)
+            .map_err(|_| invalid_argument("Invalid copy source encoding"))?;
+        let mut version_id = None;
+        for (k, v) in query {
+            match k.as_str() {
+                "versionId" => version_id = Some(v),
+                _ => {
+                    return Err(not_implemented(format!(
+                        "Unsupported copy source parameter: {k}"
+                    )));
+                }
+            }
         }
         let decoded = percent_decode_str(path)
             .decode_utf8()
             .map_err(|_| invalid_argument("Invalid copy source encoding"))?;
         let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
         match decoded.split_once('/') {
-            Some((b, k)) if !b.is_empty() && !k.is_empty() => Ok((b.to_owned(), k.to_owned())),
+            Some((b, k)) if !b.is_empty() && !k.is_empty() => Ok(CopySource {
+                bucket: b.to_owned(),
+                key: k.to_owned(),
+                version_id,
+                condition: self.copy_source_condition(),
+            }),
             _ => Err(invalid_argument(
                 "Copy Source must mention the source bucket and key: sourcebucket/sourcekey",
             )),
@@ -550,6 +597,9 @@ impl Req<'_> {
     }
     fn upload_id(&self) -> &str {
         self.query("uploadId").unwrap_or_default()
+    }
+    fn version_id(&self) -> Option<&str> {
+        self.query("versionId")
     }
 }
 
@@ -888,9 +938,39 @@ fn bucket_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Erro
         }
         Method::GET if r.has("versioning") => {
             r.allow(&["versioning"], &[], false)?;
-            ls2.bucket(bucket)?;
-            Ok(xml_response(xml_doc("VersioningConfiguration", "")))
+            let status = ls2
+                .bucket(bucket)?
+                .versioning
+                .map(|v| tag("Status", v.name()))
+                .unwrap_or_default();
+            Ok(xml_response(xml_doc("VersioningConfiguration", &status)))
         }
+        Method::PUT if r.has("versioning") => {
+            r.allow(&["versioning"], &[], false)?;
+            r.payload.verify()?;
+            #[derive(Deserialize)]
+            #[serde(rename_all = "PascalCase")]
+            struct Config {
+                status: Option<String>,
+                mfa_delete: Option<String>,
+            }
+            let config: Config =
+                quick_xml::de::from_reader(r.payload.data.as_ref()).map_err(|_| malformed_xml())?;
+            if config.mfa_delete.as_deref() == Some("Enabled") {
+                return Err(not_implemented("MFA delete is not supported"));
+            }
+            match config.status {
+                None => {
+                    ls2.bucket(bucket)?;
+                }
+                Some(status) => {
+                    let state = Versioning::parse(&status).ok_or_else(malformed_xml)?;
+                    ls2.set_bucket_versioning(bucket, state)?;
+                }
+            }
+            Ok(StatusCode::OK.into_response())
+        }
+        Method::GET if r.has("versions") => list_versions(ls2, r),
         Method::GET if r.has("uploads") => list_uploads(ls2, r),
         Method::GET if r.has("list-type") => list_objects_v2(ls2, r),
         Method::GET => list_objects_v1(ls2, r),
@@ -940,8 +1020,8 @@ fn object_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Erro
         Method::PUT => put_object(ls2, r),
         Method::GET if r.has("uploadId") => list_parts(ls2, r),
         Method::GET if r.has("tagging") => {
-            r.allow(&["tagging"], &[], false)?;
-            ls2.head_object(r.bucket(), r.key())?;
+            r.allow(&["tagging", "versionId"], &[], false)?;
+            ls2.head_object(r.bucket(), r.key(), r.version_id())?;
             Ok(xml_response(xml_doc("Tagging", "<TagSet></TagSet>")))
         }
         Method::GET | Method::HEAD => get_object(ls2, r, *method == Method::HEAD),
@@ -951,9 +1031,11 @@ fn object_op(ls2: &mut Ls2, method: &Method, r: &Req) -> Result<Response, S3Erro
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         Method::DELETE => {
-            r.allow(&[], &[], false)?;
-            ls2.delete_object(r.bucket(), r.key())?;
-            Ok(StatusCode::NO_CONTENT.into_response())
+            r.allow(&["versionId"], &[], false)?;
+            let outcome = ls2.delete_object(r.bucket(), r.key(), r.version_id(), r.now_ms)?;
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            delete_headers(response.headers_mut(), &outcome)?;
+            Ok(response)
         }
         Method::POST if r.has("uploads") => create_upload(ls2, r),
         Method::POST if r.has("uploadId") => complete_upload(ls2, r),
@@ -1140,6 +1222,87 @@ fn list_objects_v1(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
     Ok(xml_response(xml_doc("ListBucketResult", &inner)))
 }
 
+fn list_versions(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
+    r.allow(
+        &[
+            "versions",
+            "prefix",
+            "delimiter",
+            "key-marker",
+            "version-id-marker",
+            "max-keys",
+            "encoding-type",
+        ],
+        &[],
+        false,
+    )?;
+    let url = r.url_encoding()?;
+    let req = VersionListRequest {
+        prefix: r.query("prefix").unwrap_or_default().into(),
+        delimiter: r.query("delimiter").unwrap_or_default().into(),
+        key_marker: r.query("key-marker").unwrap_or_default().into(),
+        version_id_marker: r.query("version-id-marker").unwrap_or_default().into(),
+        max_keys: r.max("max-keys")?,
+    };
+    let result = ls2.list_object_versions(r.bucket(), &req)?;
+    let mut inner = tag("Name", r.bucket())
+        + &enc_tag("Prefix", &req.prefix, url)
+        + &enc_tag("KeyMarker", &req.key_marker, url)
+        + &tag("VersionIdMarker", &req.version_id_marker);
+    if let Some(k) = &result.next_key_marker {
+        inner += &enc_tag("NextKeyMarker", k, url);
+    }
+    if let Some(v) = &result.next_version_id_marker {
+        inner += &tag("NextVersionIdMarker", v);
+    }
+    inner += &format!("<MaxKeys>{}</MaxKeys>", req.max_keys);
+    if !req.delimiter.is_empty() {
+        inner += &enc_tag("Delimiter", &req.delimiter, url);
+    }
+    inner += &format!("<IsTruncated>{}</IsTruncated>", result.truncated);
+    if url {
+        inner += "<EncodingType>url</EncodingType>";
+    }
+    for v in &result.versions {
+        let o = &v.info;
+        let common = format!(
+            "{}{}<IsLatest>{}</IsLatest>{}",
+            enc_tag("Key", &o.key, url),
+            tag("VersionId", &o.version_id),
+            v.is_latest,
+            tag("LastModified", &iso8601(o.last_modified_ms)),
+        );
+        if v.delete_marker {
+            inner += &format!(
+                "<DeleteMarker>{common}<Owner>{}</Owner></DeleteMarker>",
+                owner()
+            );
+        } else {
+            let checksum = o
+                .checksum
+                .as_ref()
+                .map(|c| {
+                    tag("ChecksumAlgorithm", c.algorithm.name())
+                        + "<ChecksumType>FULL_OBJECT</ChecksumType>"
+                })
+                .unwrap_or_default();
+            inner += &format!(
+                "<Version>{common}{}{checksum}<Size>{}</Size><StorageClass>STANDARD</StorageClass><Owner>{}</Owner></Version>",
+                tag("ETag", &quoted(&o.etag)),
+                o.size,
+                owner()
+            );
+        }
+    }
+    for p in &result.common_prefixes {
+        inner += &format!(
+            "<CommonPrefixes>{}</CommonPrefixes>",
+            enc_tag("Prefix", p, url)
+        );
+    }
+    Ok(xml_response(xml_doc("ListVersionsResult", &inner)))
+}
+
 fn delete_objects(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
     r.allow(&["delete"], &[], false)?;
     r.payload.verify()?;
@@ -1165,11 +1328,6 @@ fn delete_objects(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
     if delete.objects.is_empty() || delete.objects.len() > MAX_DELETE_OBJECTS {
         return Err(malformed_xml());
     }
-    if delete.objects.iter().any(|o| o.version_id.is_some()) {
-        return Err(not_implemented(
-            "Deleting specific versions is not supported",
-        ));
-    }
     if delete
         .objects
         .iter()
@@ -1177,18 +1335,47 @@ fn delete_objects(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
     {
         return Err(not_implemented("Conditional deletes are not supported"));
     }
-    let keys: Vec<String> = delete.objects.into_iter().map(|o| o.key).collect();
-    let results = ls2.delete_objects(r.bucket(), &keys)?;
+    let objects: Vec<ObjectId> = delete
+        .objects
+        .into_iter()
+        .map(|o| ObjectId {
+            key: o.key,
+            version_id: o.version_id,
+        })
+        .collect();
+    let results = ls2.delete_objects(r.bucket(), &objects, r.now_ms)?;
     let quiet = delete.quiet.unwrap_or(false);
     let mut inner = String::new();
-    for (key, result) in keys.iter().zip(results) {
+    for (o, result) in objects.iter().zip(results) {
         match result {
-            Ok(()) if !quiet => inner += &format!("<Deleted>{}</Deleted>", tag("Key", key)),
-            Ok(()) => {}
+            Ok(_) if quiet => {}
+            Ok(outcome) => {
+                let mut entry = tag("Key", &o.key);
+                match (&o.version_id, &outcome.version_id) {
+                    (Some(v), _) => {
+                        entry += &tag("VersionId", v);
+                        if outcome.delete_marker {
+                            entry += "<DeleteMarker>true</DeleteMarker>";
+                            entry += &tag("DeleteMarkerVersionId", v);
+                        }
+                    }
+                    (None, Some(marker)) => {
+                        entry += "<DeleteMarker>true</DeleteMarker>";
+                        entry += &tag("DeleteMarkerVersionId", marker);
+                    }
+                    (None, None) => {}
+                }
+                inner += &format!("<Deleted>{entry}</Deleted>");
+            }
             Err(e) => {
+                let version = o
+                    .version_id
+                    .as_deref()
+                    .map(|v| tag("VersionId", v))
+                    .unwrap_or_default();
                 inner += &format!(
-                    "<Error>{}{}{}</Error>",
-                    tag("Key", key),
+                    "<Error>{}{version}{}{}</Error>",
+                    tag("Key", &o.key),
                     tag("Code", e.code()),
                     tag("Message", &e.to_string())
                 );
@@ -1253,6 +1440,30 @@ fn header_value(s: &str) -> Result<HeaderValue, S3Error> {
     HeaderValue::from_str(s).map_err(|_| Error::Storage(rusqlite::Error::InvalidQuery).into())
 }
 
+/// `x-amz-version-id`, sent once the bucket has had versioning configured.
+fn version_header(
+    ls2: &Ls2,
+    h: &mut HeaderMap,
+    bucket: &str,
+    name: &'static str,
+    version_id: &str,
+) -> Result<(), S3Error> {
+    if ls2.bucket(bucket)?.versioning.is_some() {
+        h.insert(name, header_value(version_id)?);
+    }
+    Ok(())
+}
+
+fn delete_headers(h: &mut HeaderMap, outcome: &DeleteOutcome) -> Result<(), S3Error> {
+    if let Some(v) = &outcome.version_id {
+        h.insert("x-amz-version-id", header_value(v)?);
+    }
+    if outcome.delete_marker {
+        h.insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+    }
+    Ok(())
+}
+
 fn checksum_headers(h: &mut HeaderMap, checksum: Option<&Checksum>) -> Result<(), S3Error> {
     if let Some(c) = checksum {
         h.insert(
@@ -1285,6 +1496,7 @@ fn put_object(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
     let h = response.headers_mut();
     h.insert(header::ETAG, header_value(&quoted(&info.etag))?);
     checksum_headers(h, info.checksum.as_ref())?;
+    version_header(ls2, h, r.bucket(), "x-amz-version-id", &info.version_id)?;
     Ok(response)
 }
 
@@ -1298,8 +1510,9 @@ const RESPONSE_OVERRIDES: [(&str, HeaderName); 6] = [
 ];
 
 fn get_object(ls2: &mut Ls2, r: &Req, head: bool) -> Result<Response, S3Error> {
-    let overrides: Vec<&str> = RESPONSE_OVERRIDES.iter().map(|(q, _)| *q).collect();
-    r.allow(&overrides, &["x-amz-checksum-mode"], false)?;
+    let mut allowed: Vec<&str> = RESPONSE_OVERRIDES.iter().map(|(q, _)| *q).collect();
+    allowed.push("versionId");
+    r.allow(&allowed, &["x-amz-checksum-mode"], false)?;
     let range = match r.header("range") {
         Some(v) if v.contains(',') => {
             return Err(not_implemented("Multiple ranges are not supported"));
@@ -1307,7 +1520,13 @@ fn get_object(ls2: &mut Ls2, r: &Req, head: bool) -> Result<Response, S3Error> {
         Some(v) => ByteRange::parse(v),
         None => None,
     };
-    let handle = ls2.open_object(r.bucket(), r.key(), range, &r.read_condition())?;
+    let handle = ls2.open_object(
+        r.bucket(),
+        r.key(),
+        r.version_id(),
+        range,
+        &r.read_condition(),
+    )?;
     let applied = handle.partial.then_some((handle.start, handle.end));
     let info = handle.info.clone();
     let body = if head {
@@ -1353,6 +1572,7 @@ fn get_object(ls2: &mut Ls2, r: &Req, head: bool) -> Result<Response, S3Error> {
         }
     }
     h.insert("x-amz-storage-class", HeaderValue::from_static("STANDARD"));
+    version_header(ls2, h, r.bucket(), "x-amz-version-id", &info.version_id)?;
     if let Some(parts) = info.etag.split_once('-').map(|(_, n)| n) {
         h.insert("x-amz-mp-parts-count", header_value(parts)?);
     }
@@ -1395,21 +1615,14 @@ fn copy_object(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
         ],
         true,
     )?;
-    let (src_bucket, src_key) = r.copy_source()?;
+    let source = r.copy_source()?;
     let metadata = match r.header("x-amz-metadata-directive") {
         None | Some("COPY") => None,
         Some("REPLACE") => Some(r.metadata()?),
         Some(_) => return Err(invalid_argument("Unknown metadata directive.")),
     };
-    let info = ls2.copy_object(
-        &src_bucket,
-        &src_key,
-        &r.copy_source_condition(),
-        r.bucket(),
-        r.key(),
-        metadata,
-        r.now_ms,
-    )?;
+    let (info, source_version) =
+        ls2.copy_object(&source, r.bucket(), r.key(), metadata, r.now_ms)?;
     let checksum = info
         .checksum
         .as_ref()
@@ -1423,7 +1636,17 @@ fn copy_object(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
             tag("LastModified", &iso8601(info.last_modified_ms))
         ),
     );
-    Ok(xml_response(body))
+    let mut response = xml_response(body);
+    let h = response.headers_mut();
+    version_header(ls2, h, r.bucket(), "x-amz-version-id", &info.version_id)?;
+    version_header(
+        ls2,
+        h,
+        &source.bucket,
+        "x-amz-copy-source-version-id",
+        &source_version,
+    )?;
+    Ok(response)
 }
 
 fn create_upload(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
@@ -1504,7 +1727,7 @@ fn upload_part_copy(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
         ],
         false,
     )?;
-    let (src_bucket, src_key) = r.copy_source()?;
+    let source = r.copy_source()?;
     let range = r
         .header("x-amz-copy-source-range")
         .map(|v| match ByteRange::parse(v) {
@@ -1512,14 +1735,12 @@ fn upload_part_copy(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
             _ => Err(invalid_argument("The x-amz-copy-source-range value must be of the form bytes=first-last where first and last are the zero-based offsets of the first and last bytes to copy")),
         })
         .transpose()?;
-    let part = ls2.upload_part_copy(
+    let (part, source_version) = ls2.upload_part_copy(
         r.bucket(),
         r.key(),
         r.upload_id(),
         r.part_number()?,
-        &src_bucket,
-        &src_key,
-        &r.copy_source_condition(),
+        &source,
         range,
         r.now_ms,
     )?;
@@ -1527,7 +1748,15 @@ fn upload_part_copy(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
         "CopyPartResult",
         &(tag("ETag", &quoted(&part.etag)) + &tag("LastModified", &iso8601(part.last_modified_ms))),
     );
-    Ok(xml_response(body))
+    let mut response = xml_response(body);
+    version_header(
+        ls2,
+        response.headers_mut(),
+        &source.bucket,
+        "x-amz-copy-source-version-id",
+        &source_version,
+    )?;
+    Ok(response)
 }
 
 fn complete_upload(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
@@ -1614,7 +1843,15 @@ fn complete_upload(ls2: &mut Ls2, r: &Req) -> Result<Response, S3Error> {
             + &tag("Key", r.key())
             + &tag("ETag", &quoted(&info.etag))),
     );
-    Ok(xml_response(body))
+    let mut response = xml_response(body);
+    version_header(
+        ls2,
+        response.headers_mut(),
+        r.bucket(),
+        "x-amz-version-id",
+        &info.version_id,
+    )?;
+    Ok(response)
 }
 
 /// Total size of the listed parts, paging through ListParts.

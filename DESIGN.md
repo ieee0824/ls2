@@ -19,7 +19,9 @@ HTTP からも Rust からも同じ検証を通ります。HTTP は `Mutex` で1
 
 ```text
 buckets(name, region, created_at_ms)
-objects(id, bucket, key BLOB, size, etag, last_modified_ms, metadata JSON, checksum JSON)  UNIQUE(bucket, key)
+buckets(..., versioning)                                                                  versioning: NULL / Enabled / Suspended
+objects(id, bucket, key BLOB, version_id, is_latest, delete_marker,
+        size, etag, last_modified_ms, metadata JSON, checksum JSON)                        UNIQUE(bucket, key, version_id)
 chunks(object_id, seq, offset, size, data BLOB)                                            PK(object_id, seq)
 uploads(id, bucket, key BLOB, initiated_at_ms, metadata JSON, checksum_algorithm)
 parts(upload_id, part_number, size, etag, last_modified_ms, checksum JSON, data BLOB)      PK(upload_id, part_number)
@@ -29,7 +31,15 @@ parts(upload_id, part_number, size, etag, last_modified_ms, checksum JSON, data 
 - **本体はチャンク**に分けます。単一 PUT は1チャンク、マルチパートはパートごとに1チャンクです。Complete は `INSERT ... SELECT` でパートをチャンクへ移し、Rust 側で全データを連結しません。Range 読み出しは対象チャンクだけを `substr` で切り出します。SQLite の BLOB 上限（約1 GB）は1チャンクにだけ適用されます。
 - 上書き・削除は外部キーの `ON DELETE CASCADE` でチャンクも消します。上書きは「旧行削除 → 新行挿入 → チャンク挿入」を1つの Immediate トランザクションで行い、途中失敗では旧オブジェクトが残ります。
 - 整合性チェック（MD5・チェックサム）はトランザクションの前に行い、不一致なら何も保存しません。
-- `PRAGMA user_version` にスキーマ版を記録し、新しい版の DB は開きません。スキーマ変更時は明示的なマイグレーションを追加します。
+- `PRAGMA user_version` にスキーマ版を記録し、新しい版の DB は開きません。スキーマ変更は `src/schema.rs` の明示的なマイグレーションで行い、1版ずつ Immediate トランザクションで適用します。v1 → v2（バージョニング）は `UNIQUE(bucket, key)` を外すためにテーブルを作り直します。このとき外部キーを無効にしないと `DROP TABLE objects` がチャンクまで削除するため、無効にして移行し、`foreign_key_check` で参照切れがないことを確かめてから確定します。既存のオブジェクトは `null` バージョンになります。
+
+### バージョン
+
+1つのキーの全バージョン（削除マーカーを含む）を `objects` の行として持ち、行 id の大きいものが新しいバージョンです。キーを変更するたびに「最大 id の行だけ `is_latest = 1`」に更新します。通常の一覧は部分インデックス `objects_current (bucket, key) WHERE is_latest = 1 AND delete_marker = 0` を使うため、古いバージョンが増えても走査量は変わりません。`ListObjectVersions` は `(key 昇順, id 降順)` のインデックスで、通常の一覧と同じカーソル方式で読みます。
+
+- 未設定・停止中の書き込みは `null` バージョンの行を置き換え、有効中は新しい行を追加します。
+- バージョン ID は32桁の16進数か `null` です。それ以外の形式は S3 と同じく `InvalidArgument` にします。
+- ストリーミング読み出しの途中でバージョンが削除・置き換えされたことは、行 id・ETag・更新時刻の比較で検出します。
 
 ## 一覧
 
@@ -81,5 +91,5 @@ les のメール閲覧と同じく、サーバー側で HTML を組み立てま�
 
 ## 今後の拡張
 
-- **P3**: バージョニング（`objects` に version 列を追加するマイグレーション）、オブジェクト/バケットのタグ、CORS（ブラウザから直接アップロードする開発用）、ライフサイクルによる期限切れ削除（注入した時刻で決定的にテスト）、lqs へのイベント通知（S3 → SQS）。
+- **P3**: オブジェクト/バケットのタグ、CORS（ブラウザから直接アップロードする開発用）、ライフサイクルによる期限切れ削除（注入した時刻で決定的にテスト）、lqs へのイベント通知（S3 → SQS）。
 - マルチパートの完成オブジェクトに FULL_OBJECT / COMPOSITE チェックサムを付けることも検討対象です。

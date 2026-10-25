@@ -1,10 +1,13 @@
 //! Local S3 core. Synchronous and SQLite-backed; callers supply Unix milliseconds.
 pub mod checksum;
 mod multipart;
+mod schema;
 pub mod server;
+mod versions;
 
 pub use checksum::{Checksum, ChecksumAlgorithm, ChecksumInput};
 pub use multipart::{CompletedPart, PartInfo, UploadInfo};
+pub use versions::{VersionEntry, VersionListRequest, VersionListResult};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -17,13 +20,22 @@ pub const MAX_KEY_BYTES: usize = 1024;
 pub const MAX_USER_METADATA_BYTES: usize = 2048;
 pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 pub const MAX_PART_NUMBER: u32 = 10_000;
-const SCHEMA_VERSION: i64 = 1;
+/// Version ID of objects written while versioning was not enabled.
+pub const NULL_VERSION: &str = "null";
 
 #[derive(Debug)]
 pub enum Error {
     NoSuchBucket,
     NoSuchKey,
     NoSuchUpload,
+    NoSuchVersion,
+    /// The addressed object is a delete marker. `requested` is true when the marker
+    /// was named by version ID (405 in S3) rather than being the latest version (404).
+    DeleteMarker {
+        version_id: String,
+        last_modified_ms: i64,
+        requested: bool,
+    },
     BucketAlreadyOwnedByYou,
     BucketNotEmpty,
     InvalidBucketName,
@@ -49,6 +61,13 @@ impl Error {
             Self::NoSuchBucket => "NoSuchBucket",
             Self::NoSuchKey => "NoSuchKey",
             Self::NoSuchUpload => "NoSuchUpload",
+            Self::NoSuchVersion => "NoSuchVersion",
+            Self::DeleteMarker {
+                requested: false, ..
+            } => "NoSuchKey",
+            Self::DeleteMarker {
+                requested: true, ..
+            } => "MethodNotAllowed",
             Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
             Self::BucketNotEmpty => "BucketNotEmpty",
             Self::InvalidBucketName => "InvalidBucketName",
@@ -81,6 +100,13 @@ impl std::fmt::Display for Error {
             Self::NoSuchBucket => "The specified bucket does not exist",
             Self::NoSuchKey => "The specified key does not exist.",
             Self::NoSuchUpload => "The specified upload does not exist.",
+            Self::NoSuchVersion => "The specified version does not exist.",
+            Self::DeleteMarker {
+                requested: false, ..
+            } => "The specified key does not exist.",
+            Self::DeleteMarker {
+                requested: true, ..
+            } => "The specified method is not allowed against this resource.",
             Self::BucketAlreadyOwnedByYou => {
                 "Your previous request to create the named bucket succeeded and you already own it."
             }
@@ -140,11 +166,36 @@ impl Metadata {
     }
 }
 
+/// Bucket versioning state. A bucket never returns to "unversioned" once enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Versioning {
+    Enabled,
+    Suspended,
+}
+
+impl Versioning {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Enabled => "Enabled",
+            Self::Suspended => "Suspended",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Enabled" => Some(Self::Enabled),
+            "Suspended" => Some(Self::Suspended),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Bucket {
     pub name: String,
     pub region: String,
     pub created_at_ms: i64,
+    /// `None` until versioning is first configured.
+    pub versioning: Option<Versioning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,6 +208,34 @@ pub struct ObjectInfo {
     pub last_modified_ms: i64,
     pub metadata: Metadata,
     pub checksum: Option<Checksum>,
+    /// [`NULL_VERSION`] unless written while versioning was enabled.
+    pub version_id: String,
+}
+
+/// Result of deleting a key or a version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    /// The version removed, or the delete marker created; `None` in unversioned buckets.
+    pub version_id: Option<String>,
+    /// A delete marker was created, or the removed version was a delete marker.
+    pub delete_marker: bool,
+}
+
+/// One key (optionally one version) of DeleteObjects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectId {
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+/// The source of CopyObject / UploadPartCopy.
+#[derive(Debug, Clone, Default)]
+pub struct CopySource {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+    /// `x-amz-copy-source-if-*`; every failure is PreconditionFailed.
+    pub condition: ReadCondition,
 }
 
 /// Conditions for writes (`If-Match` / `If-None-Match: *`).
@@ -274,7 +353,12 @@ pub struct BucketStats {
     pub name: String,
     pub region: String,
     pub created_at_ms: i64,
+    pub versioning: Option<Versioning>,
+    /// Current (latest, not deleted) objects.
     pub objects: u64,
+    /// Stored versions, including noncurrent versions and delete markers.
+    pub versions: u64,
+    /// Bytes stored across all versions.
     pub bytes: u64,
     pub multipart_uploads: u64,
 }
@@ -290,57 +374,8 @@ impl Ls2 {
     pub fn in_memory() -> Result<Self, Error> {
         Self::init(Connection::open_in_memory()?)
     }
-    fn init(conn: Connection) -> Result<Self, Error> {
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-            PRAGMA foreign_keys=ON;
-            CREATE TABLE IF NOT EXISTS buckets (
-                name TEXT PRIMARY KEY,
-                region TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS objects (
-                id INTEGER PRIMARY KEY,
-                bucket TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
-                key BLOB NOT NULL,
-                size INTEGER NOT NULL,
-                etag TEXT NOT NULL,
-                last_modified_ms INTEGER NOT NULL,
-                metadata TEXT NOT NULL,
-                checksum TEXT,
-                UNIQUE (bucket, key));
-            CREATE TABLE IF NOT EXISTS chunks (
-                object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
-                seq INTEGER NOT NULL,
-                offset INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                data BLOB NOT NULL,
-                PRIMARY KEY (object_id, seq));
-            CREATE TABLE IF NOT EXISTS uploads (
-                id TEXT PRIMARY KEY,
-                bucket TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
-                key BLOB NOT NULL,
-                initiated_at_ms INTEGER NOT NULL,
-                metadata TEXT NOT NULL,
-                checksum_algorithm TEXT);
-            CREATE INDEX IF NOT EXISTS uploads_by_key ON uploads (bucket, key, initiated_at_ms, id);
-            CREATE TABLE IF NOT EXISTS parts (
-                upload_id TEXT NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
-                part_number INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                etag TEXT NOT NULL,
-                last_modified_ms INTEGER NOT NULL,
-                checksum TEXT,
-                data BLOB NOT NULL,
-                PRIMARY KEY (upload_id, part_number));",
-        )?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(Error::InvalidRequest(format!(
-                "Database schema version {version} is newer than this ls2 ({SCHEMA_VERSION})"
-            )));
-        }
-        conn.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION}"))?;
+    fn init(mut conn: Connection) -> Result<Self, Error> {
+        schema::init(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -401,17 +436,11 @@ impl Ls2 {
         limit: usize,
     ) -> Result<(Vec<Bucket>, bool), Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, region, created_at_ms FROM buckets
+            "SELECT name, region, created_at_ms, versioning FROM buckets
              WHERE name > ?1 AND substr(name, 1, length(?2)) = ?2 ORDER BY name LIMIT ?3",
         )?;
         let mut buckets = stmt
-            .query_map(params![after, prefix, limit as i64 + 1], |r| {
-                Ok(Bucket {
-                    name: r.get(0)?,
-                    region: r.get(1)?,
-                    created_at_ms: r.get(2)?,
-                })
-            })?
+            .query_map(params![after, prefix, limit as i64 + 1], decode_bucket)?
             .collect::<Result<Vec<_>, _>>()?;
         let truncated = buckets.len() > limit;
         buckets.truncate(limit);
@@ -437,23 +466,41 @@ impl Ls2 {
 
     pub fn stats(&self) -> Result<Vec<BucketStats>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT b.name, b.region, b.created_at_ms,
+            "SELECT b.name, b.region, b.created_at_ms, b.versioning,
+                (SELECT count(*) FROM objects o
+                 WHERE o.bucket = b.name AND o.is_latest = 1 AND o.delete_marker = 0),
                 (SELECT count(*) FROM objects o WHERE o.bucket = b.name),
                 (SELECT coalesce(sum(size), 0) FROM objects o WHERE o.bucket = b.name),
                 (SELECT count(*) FROM uploads u WHERE u.bucket = b.name)
              FROM buckets b ORDER BY b.name",
         )?;
         let rows = stmt.query_map([], |r| {
+            let bucket = decode_bucket(r)?;
             Ok(BucketStats {
-                name: r.get(0)?,
-                region: r.get(1)?,
-                created_at_ms: r.get(2)?,
-                objects: r.get(3)?,
-                bytes: r.get(4)?,
-                multipart_uploads: r.get(5)?,
+                name: bucket.name,
+                region: bucket.region,
+                created_at_ms: bucket.created_at_ms,
+                versioning: bucket.versioning,
+                objects: r.get(4)?,
+                versions: r.get(5)?,
+                bytes: r.get(6)?,
+                multipart_uploads: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// PutBucketVersioning. Enabled buckets give each write a new version ID;
+    /// suspended buckets write the `null` version again.
+    pub fn set_bucket_versioning(&mut self, bucket: &str, state: Versioning) -> Result<(), Error> {
+        let tx = self.write_tx()?;
+        require_bucket(&tx, bucket)?;
+        tx.execute(
+            "UPDATE buckets SET versioning=?2 WHERE name=?1",
+            params![bucket, state.name()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     // ---- objects ----
@@ -474,6 +521,8 @@ impl Ls2 {
         let checksum = opts
             .checksum
             .resolve(data, Some(ChecksumAlgorithm::Crc64Nvme))?;
+        let tx = self.write_tx()?;
+        let versioning = bucket_versioning(&tx, bucket)?;
         let info = ObjectInfo {
             bucket: bucket.into(),
             key: key.into(),
@@ -482,11 +531,10 @@ impl Ls2 {
             last_modified_ms: now_ms,
             metadata: opts.metadata,
             checksum,
+            version_id: new_version_id(versioning),
         };
-        let tx = self.write_tx()?;
-        require_bucket(&tx, bucket)?;
         check_write_condition(&tx, bucket, key, &opts.condition)?;
-        let id = replace_object(&tx, &info)?;
+        let id = write_version(&tx, &info, versioning)?;
         if !data.is_empty() {
             tx.execute(
                 "INSERT INTO chunks(object_id, seq, offset, size, data) VALUES (?1, 0, 0, ?2, ?3)",
@@ -497,23 +545,14 @@ impl Ls2 {
         Ok(info)
     }
 
-    pub fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo, Error> {
-        require_bucket(&self.conn, bucket)?;
-        Ok(load_object(&self.conn, bucket, key)?
-            .ok_or(Error::NoSuchKey)?
-            .1)
-    }
-
-    /// Evaluates read conditions and returns metadata only.
-    pub fn head_object_if(
+    /// Metadata of the latest version (`version_id: None`) or of one version.
+    pub fn head_object(
         &self,
         bucket: &str,
         key: &str,
-        cond: &ReadCondition,
+        version_id: Option<&str>,
     ) -> Result<ObjectInfo, Error> {
-        let info = self.head_object(bucket, key)?;
-        check_read_condition(&info, cond)?;
-        Ok(info)
+        Ok(resolve_object(&self.conn, bucket, key, version_id)?.1)
     }
 
     pub fn get_object(
@@ -524,7 +563,7 @@ impl Ls2 {
         cond: &ReadCondition,
     ) -> Result<GetOutput, Error> {
         let tx = self.conn.unchecked_transaction()?;
-        let handle = open_object(&tx, bucket, key, range, cond)?;
+        let handle = open_object(&tx, bucket, key, None, range, cond)?;
         let data = read_range(&tx, handle.id, handle.start, handle.end)?;
         Ok(GetOutput {
             range: handle.partial.then_some((handle.start, handle.end)),
@@ -539,10 +578,11 @@ impl Ls2 {
         &self,
         bucket: &str,
         key: &str,
+        version_id: Option<&str>,
         range: Option<ByteRange>,
         cond: &ReadCondition,
     ) -> Result<ObjectHandle, Error> {
-        open_object(&self.conn, bucket, key, range, cond)
+        open_object(&self.conn, bucket, key, version_id, range, cond)
     }
 
     /// Reads `[offset, offset + len)` of the object behind `handle` (clamped to its size).
@@ -570,29 +610,47 @@ impl Ls2 {
         read_range(&tx, handle.id, start, end)
     }
 
-    /// Deleting a missing key succeeds, as in S3.
-    pub fn delete_object(&mut self, bucket: &str, key: &str) -> Result<(), Error> {
+    /// DeleteObject. Without a version ID this removes the object (unversioned bucket) or
+    /// adds a delete marker (versioned bucket); with one, it removes that version for good.
+    /// Deleting a missing key or version succeeds, as in S3.
+    pub fn delete_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<DeleteOutcome, Error> {
         let tx = self.write_tx()?;
-        require_bucket(&tx, bucket)?;
-        delete_key(&tx, bucket, key)?;
+        let versioning = bucket_versioning(&tx, bucket)?;
+        let outcome = delete_in(&tx, bucket, key, version_id, versioning, now_ms)?;
         tx.commit()?;
-        Ok(())
+        Ok(outcome)
     }
 
     /// Deletes keys in one transaction; per-key results in input order.
     pub fn delete_objects(
         &mut self,
         bucket: &str,
-        keys: &[String],
-    ) -> Result<Vec<Result<(), Error>>, Error> {
+        objects: &[ObjectId],
+        now_ms: i64,
+    ) -> Result<Vec<Result<DeleteOutcome, Error>>, Error> {
         let tx = self.write_tx()?;
-        require_bucket(&tx, bucket)?;
-        let mut results = Vec::with_capacity(keys.len());
-        for key in keys {
-            results.push(match validate_key(key) {
+        let versioning = bucket_versioning(&tx, bucket)?;
+        let mut results = Vec::with_capacity(objects.len());
+        for o in objects {
+            results.push(match validate_key(&o.key) {
                 Ok(()) => {
-                    delete_key(&tx, bucket, key)?;
-                    Ok(())
+                    match delete_in(
+                        &tx,
+                        bucket,
+                        &o.key,
+                        o.version_id.as_deref(),
+                        versioning,
+                        now_ms,
+                    ) {
+                        Err(Error::Storage(e)) => return Err(Error::Storage(e)),
+                        other => other,
+                    }
                 }
                 Err(e) => Err(e),
             });
@@ -602,47 +660,54 @@ impl Ls2 {
     }
 
     /// Server-side copy. `metadata: None` copies the source metadata (COPY directive).
-    /// The copy keeps the source ETag and checksum. `source` holds the
-    /// `x-amz-copy-source-if-*` conditions; any failure is PreconditionFailed.
-    #[allow(clippy::too_many_arguments)]
+    /// The copy keeps the source ETag and checksum and gets its own version ID.
+    /// Returns the new object and the version ID of the source that was copied.
     pub fn copy_object(
         &mut self,
-        src_bucket: &str,
-        src_key: &str,
-        source: &ReadCondition,
+        source: &CopySource,
         dst_bucket: &str,
         dst_key: &str,
         metadata: Option<Metadata>,
         now_ms: i64,
-    ) -> Result<ObjectInfo, Error> {
+    ) -> Result<(ObjectInfo, String), Error> {
         validate_key(dst_key)?;
         if let Some(m) = &metadata {
             m.validate()?;
         }
         let tx = self.write_tx()?;
-        require_bucket(&tx, src_bucket)?;
-        let (src_id, src) = load_object(&tx, src_bucket, src_key)?.ok_or(Error::NoSuchKey)?;
-        check_copy_condition(&src, source)?;
-        require_bucket(&tx, dst_bucket)?;
+        let (src_id, src) = resolve_copy_source(&tx, source)?;
+        check_copy_condition(&src, &source.condition)?;
+        let versioning = bucket_versioning(&tx, dst_bucket)?;
+        // Copying the latest version onto itself must change something; copying an older
+        // version onto its key restores it.
+        let same_key = source.bucket == dst_bucket && source.key == dst_key;
+        let copies_latest =
+            same_key && load_latest(&tx, dst_bucket, dst_key)?.is_some_and(|r| r.id == src_id);
+        if copies_latest && metadata.is_none() {
+            return Err(Error::InvalidRequest(
+                "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.".into(),
+            ));
+        }
         let info = ObjectInfo {
             bucket: dst_bucket.into(),
             key: dst_key.into(),
             last_modified_ms: now_ms,
-            metadata: metadata.clone().unwrap_or_else(|| src.metadata.clone()),
-            ..src
+            metadata: metadata.unwrap_or_else(|| src.metadata.clone()),
+            version_id: new_version_id(versioning),
+            ..src.clone()
         };
-        if src_bucket == dst_bucket && src_key == dst_key {
-            if metadata.is_none() {
-                return Err(Error::InvalidRequest(
-                    "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.".into(),
-                ));
-            }
+        let replaces_source = source.bucket == dst_bucket
+            && source.key == dst_key
+            && src.version_id == NULL_VERSION
+            && versioning != Some(Versioning::Enabled);
+        if replaces_source {
+            // The new `null` version would replace its own source: update it in place.
             tx.execute(
                 "UPDATE objects SET metadata=?2, last_modified_ms=?3 WHERE id=?1",
                 params![src_id, to_json(&info.metadata), now_ms],
             )?;
         } else {
-            let id = replace_object(&tx, &info)?;
+            let id = write_version(&tx, &info, versioning)?;
             tx.execute(
                 "INSERT INTO chunks(object_id, seq, offset, size, data)
                  SELECT ?1, seq, offset, size, data FROM chunks WHERE object_id=?2",
@@ -650,7 +715,7 @@ impl Ls2 {
             )?;
         }
         tx.commit()?;
-        Ok(info)
+        Ok((info, src.version_id))
     }
 
     /// Lists keys in UTF-8 binary order, grouping by `delimiter` into common prefixes.
@@ -672,21 +737,22 @@ impl Ls2 {
         } else {
             (prefix.to_vec(), true)
         };
-        let mut stmt = tx.prepare(
-            "SELECT id, key, size, etag, last_modified_ms, metadata, checksum FROM objects
-             WHERE bucket = ?1 AND (key > ?2 OR (?3 AND key = ?2)) AND (?4 IS NULL OR key < ?4)
-             ORDER BY key LIMIT 256",
-        )?;
+        let mut stmt = tx.prepare(&format!(
+            "SELECT {OBJECT_COLUMNS} FROM objects
+             WHERE bucket = ?1 AND is_latest = 1 AND delete_marker = 0
+               AND (key > ?2 OR (?3 AND key = ?2)) AND (?4 IS NULL OR key < ?4)
+             ORDER BY key LIMIT 256"
+        ))?;
         let mut last_prefix: Option<Vec<u8>> = None;
         'scan: loop {
             let rows = stmt
                 .query_map(params![bucket, cursor.0, cursor.1, upper], |r| {
-                    decode_object(r, bucket)
+                    decode_row(r, bucket)
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             let fetched = rows.len();
             let mut jumped = false;
-            for (_, info) in rows {
+            for Row { info, .. } in rows {
                 let key = info.key.as_bytes();
                 let rest = &key[prefix.len()..];
                 if let Some(i) = (!delimiter.is_empty())
@@ -748,11 +814,21 @@ pub(crate) fn key_string(bytes: Vec<u8>, col: usize) -> rusqlite::Result<String>
     })
 }
 
-fn decode_object(r: &rusqlite::Row<'_>, bucket: &str) -> rusqlite::Result<(i64, ObjectInfo)> {
+pub(crate) const OBJECT_COLUMNS: &str = "id, key, size, etag, last_modified_ms, metadata, checksum, version_id, is_latest, delete_marker";
+
+/// One stored version (object or delete marker).
+pub(crate) struct Row {
+    pub id: i64,
+    pub info: ObjectInfo,
+    pub is_latest: bool,
+    pub delete_marker: bool,
+}
+
+pub(crate) fn decode_row(r: &rusqlite::Row<'_>, bucket: &str) -> rusqlite::Result<Row> {
     let checksum: Option<String> = r.get(6)?;
-    Ok((
-        r.get(0)?,
-        ObjectInfo {
+    Ok(Row {
+        id: r.get(0)?,
+        info: ObjectInfo {
             bucket: bucket.into(),
             key: key_string(r.get(1)?, 1)?,
             size: r.get(2)?,
@@ -760,71 +836,213 @@ fn decode_object(r: &rusqlite::Row<'_>, bucket: &str) -> rusqlite::Result<(i64, 
             last_modified_ms: r.get(4)?,
             metadata: from_json(&r.get::<_, String>(5)?, 5)?,
             checksum: checksum.map(|c| from_json(&c, 6)).transpose()?,
+            version_id: r.get(7)?,
         },
-    ))
+        is_latest: r.get(8)?,
+        delete_marker: r.get(9)?,
+    })
+}
+
+fn decode_bucket(r: &rusqlite::Row<'_>) -> rusqlite::Result<Bucket> {
+    let versioning: Option<String> = r.get(3)?;
+    Ok(Bucket {
+        name: r.get(0)?,
+        region: r.get(1)?,
+        created_at_ms: r.get(2)?,
+        versioning: versioning.as_deref().and_then(Versioning::parse),
+    })
 }
 
 fn load_bucket(conn: &Connection, name: &str) -> Result<Option<Bucket>, Error> {
     Ok(conn
         .query_row(
-            "SELECT name, region, created_at_ms FROM buckets WHERE name=?1",
+            "SELECT name, region, created_at_ms, versioning FROM buckets WHERE name=?1",
             [name],
-            |r| {
-                Ok(Bucket {
-                    name: r.get(0)?,
-                    region: r.get(1)?,
-                    created_at_ms: r.get(2)?,
-                })
-            },
+            decode_bucket,
         )
         .optional()?)
 }
 
 pub(crate) fn require_bucket(conn: &Connection, name: &str) -> Result<(), Error> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM buckets WHERE name=?1)",
-        [name],
-        |r| r.get(0),
-    )?;
-    if exists {
-        Ok(())
-    } else {
-        Err(Error::NoSuchBucket)
+    bucket_versioning(conn, name).map(|_| ())
+}
+
+/// The bucket's versioning state; NoSuchBucket if it does not exist.
+pub(crate) fn bucket_versioning(
+    conn: &Connection,
+    name: &str,
+) -> Result<Option<Versioning>, Error> {
+    let state: Option<Option<String>> = conn
+        .query_row(
+            "SELECT versioning FROM buckets WHERE name=?1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(state
+        .ok_or(Error::NoSuchBucket)?
+        .as_deref()
+        .and_then(Versioning::parse))
+}
+
+pub(crate) fn new_version_id(versioning: Option<Versioning>) -> String {
+    match versioning {
+        Some(Versioning::Enabled) => uuid::Uuid::new_v4().simple().to_string(),
+        _ => NULL_VERSION.into(),
     }
 }
 
-pub(crate) fn load_object(
+/// Version IDs are `null` or 32 lowercase hex digits; anything else is rejected as in S3.
+pub(crate) fn validate_version_id(v: &str) -> Result<(), Error> {
+    if v == NULL_VERSION
+        || (v.len() == 32 && v.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(
+            "Invalid version id specified".into(),
+        ))
+    }
+}
+
+fn load_one(
     conn: &Connection,
     bucket: &str,
-    key: &str,
-) -> Result<Option<(i64, ObjectInfo)>, Error> {
+    filter: &str,
+    args: &[&dyn rusqlite::ToSql],
+) -> Result<Option<Row>, Error> {
     Ok(conn
         .query_row(
-            "SELECT id, key, size, etag, last_modified_ms, metadata, checksum FROM objects
-             WHERE bucket=?1 AND key=?2",
-            params![bucket, key.as_bytes()],
-            |r| decode_object(r, bucket),
+            &format!(
+                "SELECT {OBJECT_COLUMNS} FROM objects WHERE bucket=?1 AND key=?2 AND {filter}"
+            ),
+            args,
+            |r| decode_row(r, bucket),
         )
         .optional()?)
 }
 
-fn delete_key(conn: &Connection, bucket: &str, key: &str) -> Result<(), Error> {
+pub(crate) fn load_latest(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<Row>, Error> {
+    load_one(
+        conn,
+        bucket,
+        "is_latest = 1",
+        params![bucket, key.as_bytes()],
+    )
+}
+
+pub(crate) fn load_version(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<Row>, Error> {
+    load_one(
+        conn,
+        bucket,
+        "version_id = ?3",
+        params![bucket, key.as_bytes(), version_id],
+    )
+}
+
+/// The latest version unless it is a delete marker.
+pub(crate) fn load_current(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<(i64, ObjectInfo)>, Error> {
+    Ok(load_latest(conn, bucket, key)?
+        .filter(|r| !r.delete_marker)
+        .map(|r| (r.id, r.info)))
+}
+
+/// The object addressed by a read: the latest version or the named one.
+pub(crate) fn resolve_object(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<(i64, ObjectInfo), Error> {
+    require_bucket(conn, bucket)?;
+    let row = match version_id {
+        None => load_latest(conn, bucket, key)?.ok_or(Error::NoSuchKey)?,
+        Some(v) => {
+            validate_version_id(v)?;
+            load_version(conn, bucket, key, v)?.ok_or(Error::NoSuchVersion)?
+        }
+    };
+    if row.delete_marker {
+        return Err(Error::DeleteMarker {
+            version_id: row.info.version_id,
+            last_modified_ms: row.info.last_modified_ms,
+            requested: version_id.is_some(),
+        });
+    }
+    Ok((row.id, row.info))
+}
+
+/// A copy source may not name a delete marker by version ID (400 in S3).
+pub(crate) fn resolve_copy_source(
+    conn: &Connection,
+    source: &CopySource,
+) -> Result<(i64, ObjectInfo), Error> {
+    resolve_object(conn, &source.bucket, &source.key, source.version_id.as_deref()).map_err(
+        |e| match e {
+            Error::DeleteMarker {
+                requested: true, ..
+            } => Error::InvalidRequest(
+                "The source of a copy request may not specifically refer to a delete marker by version id.".into(),
+            ),
+            e => e,
+        },
+    )
+}
+
+/// Marks the newest remaining version of `key` as the latest one.
+fn refresh_latest(conn: &Connection, bucket: &str, key: &str) -> Result<(), Error> {
     conn.execute(
-        "DELETE FROM objects WHERE bucket=?1 AND key=?2",
+        "UPDATE objects SET is_latest = (id = (SELECT max(id) FROM objects WHERE bucket=?1 AND key=?2))
+         WHERE bucket=?1 AND key=?2",
         params![bucket, key.as_bytes()],
     )?;
     Ok(())
 }
 
-/// Replaces the row for `info.key` and returns the new object id (chunks are added by the caller).
-pub(crate) fn replace_object(conn: &Connection, info: &ObjectInfo) -> Result<i64, Error> {
-    delete_key(conn, &info.bucket, &info.key)?;
+/// Inserts `info` as the new latest version and returns its row id (chunks are added by
+/// the caller). Unless versioning is enabled, it replaces the existing `null` version.
+pub(crate) fn write_version(
+    conn: &Connection,
+    info: &ObjectInfo,
+    versioning: Option<Versioning>,
+) -> Result<i64, Error> {
+    insert_row(conn, info, false, versioning)
+}
+
+fn insert_row(
+    conn: &Connection,
+    info: &ObjectInfo,
+    delete_marker: bool,
+    versioning: Option<Versioning>,
+) -> Result<i64, Error> {
+    if versioning != Some(Versioning::Enabled) {
+        conn.execute(
+            "DELETE FROM objects WHERE bucket=?1 AND key=?2 AND version_id=?3",
+            params![info.bucket, info.key.as_bytes(), NULL_VERSION],
+        )?;
+    }
     conn.execute(
-        "INSERT INTO objects(bucket, key, size, etag, last_modified_ms, metadata, checksum)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO objects(bucket, key, version_id, is_latest, delete_marker,
+                             size, etag, last_modified_ms, metadata, checksum)
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             info.bucket,
             info.key.as_bytes(),
+            info.version_id,
+            delete_marker,
             info.size as i64,
             info.etag,
             info.last_modified_ms,
@@ -832,7 +1050,58 @@ pub(crate) fn replace_object(conn: &Connection, info: &ObjectInfo) -> Result<i64
             info.checksum.as_ref().map(to_json),
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    refresh_latest(conn, &info.bucket, &info.key)?;
+    Ok(id)
+}
+
+fn delete_in(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    versioning: Option<Versioning>,
+    now_ms: i64,
+) -> Result<DeleteOutcome, Error> {
+    if let Some(v) = version_id {
+        validate_version_id(v)?;
+        let removed = load_version(conn, bucket, key, v)?;
+        conn.execute(
+            "DELETE FROM objects WHERE bucket=?1 AND key=?2 AND version_id=?3",
+            params![bucket, key.as_bytes(), v],
+        )?;
+        refresh_latest(conn, bucket, key)?;
+        return Ok(DeleteOutcome {
+            version_id: Some(v.into()),
+            delete_marker: removed.is_some_and(|r| r.delete_marker),
+        });
+    }
+    if versioning.is_none() {
+        conn.execute(
+            "DELETE FROM objects WHERE bucket=?1 AND key=?2",
+            params![bucket, key.as_bytes()],
+        )?;
+        return Ok(DeleteOutcome {
+            version_id: None,
+            delete_marker: false,
+        });
+    }
+    // Versioned: a delete marker becomes the latest version (even for a missing key).
+    let marker = ObjectInfo {
+        bucket: bucket.into(),
+        key: key.into(),
+        size: 0,
+        etag: String::new(),
+        last_modified_ms: now_ms,
+        metadata: Metadata::default(),
+        checksum: None,
+        version_id: new_version_id(versioning),
+    };
+    insert_row(conn, &marker, true, versioning)?;
+    Ok(DeleteOutcome {
+        version_id: Some(marker.version_id),
+        delete_marker: true,
+    })
 }
 
 pub(crate) fn check_write_condition(
@@ -844,7 +1113,7 @@ pub(crate) fn check_write_condition(
     if !cond.if_none_match_any && cond.if_match.is_none() {
         return Ok(());
     }
-    let existing = load_object(conn, bucket, key)?;
+    let existing = load_current(conn, bucket, key)?;
     if cond.if_none_match_any && existing.is_some() {
         return Err(Error::PreconditionFailed);
     }
@@ -906,11 +1175,11 @@ fn open_object(
     conn: &Connection,
     bucket: &str,
     key: &str,
+    version_id: Option<&str>,
     range: Option<ByteRange>,
     cond: &ReadCondition,
 ) -> Result<ObjectHandle, Error> {
-    require_bucket(conn, bucket)?;
-    let (id, info) = load_object(conn, bucket, key)?.ok_or(Error::NoSuchKey)?;
+    let (id, info) = resolve_object(conn, bucket, key, version_id)?;
     check_read_condition(&info, cond)?;
     let resolved = range.map(|r| r.resolve(info.size)).transpose()?;
     let (start, end) = resolved.unwrap_or((0, info.size));

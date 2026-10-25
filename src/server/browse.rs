@@ -1,7 +1,7 @@
 //! `/_ls2/*`: health, status, and a read-only HTML browser for buckets and objects.
 //! Pages are rendered on the server and every stored value is HTML-escaped.
 use super::{Shared, URL_ENCODE, esc, iso8601, lock, object_body};
-use crate::{ListRequest, ObjectInfo, ReadCondition};
+use crate::{Error, ListRequest, ObjectInfo, ReadCondition, VersionListRequest};
 use axum::{
     Json,
     body::Body,
@@ -40,7 +40,7 @@ pub(super) fn handle(state: &Shared, method: &Method, uri: &Uri) -> Response {
         ["status"] => status(state),
         ["browse"] => buckets_page(state),
         ["browse", bucket] => match param("key") {
-            Some(key) => object_page(state, bucket, key),
+            Some(key) => object_page(state, bucket, key, param("versionId")),
             None => folder_page(
                 state,
                 bucket,
@@ -48,7 +48,12 @@ pub(super) fn handle(state: &Shared, method: &Method, uri: &Uri) -> Response {
                 param("after").unwrap_or_default(),
             ),
         },
-        ["download", bucket] => download(state, bucket, param("key").unwrap_or_default()),
+        ["download", bucket] => download(
+            state,
+            bucket,
+            param("key").unwrap_or_default(),
+            param("versionId"),
+        ),
         _ => Err(Page::error(StatusCode::NOT_FOUND, "Not found")),
     };
     let mut response = result.unwrap_or_else(Page::into_response);
@@ -110,12 +115,25 @@ fn folder_link(bucket: &str, prefix: &str) -> String {
     }
 }
 
-fn object_link(bucket: &str, key: &str) -> String {
-    format!("/_ls2/browse/{}?key={}", enc(bucket), enc(key))
+fn with_version(mut link: String, version_id: Option<&str>) -> String {
+    if let Some(v) = version_id {
+        link += &format!("&versionId={}", enc(v));
+    }
+    link
 }
 
-fn download_link(bucket: &str, key: &str) -> String {
-    format!("/_ls2/download/{}?key={}", enc(bucket), enc(key))
+fn object_link(bucket: &str, key: &str, version_id: Option<&str>) -> String {
+    with_version(
+        format!("/_ls2/browse/{}?key={}", enc(bucket), enc(key)),
+        version_id,
+    )
+}
+
+fn download_link(bucket: &str, key: &str, version_id: Option<&str>) -> String {
+    with_version(
+        format!("/_ls2/download/{}?key={}", enc(bucket), enc(key)),
+        version_id,
+    )
 }
 
 fn a(href: &str, text: &str) -> String {
@@ -205,13 +223,15 @@ fn buckets_page(state: &Shared) -> Result<Response, Page> {
     if buckets.is_empty() {
         body += "<p class=\"muted\">No buckets yet.</p>";
     } else {
-        body += "<div class=\"table\"><table><tr><th>Name</th><th>Region</th><th class=\"num\">Objects</th><th class=\"num\">Size</th><th class=\"num\">Uploads</th><th>Created</th></tr>";
+        body += "<div class=\"table\"><table><tr><th>Name</th><th>Region</th><th>Versioning</th><th class=\"num\">Objects</th><th class=\"num\">Versions</th><th class=\"num\">Size</th><th class=\"num\">Uploads</th><th>Created</th></tr>";
         for b in &buckets {
             body += &format!(
-                "<tr><td class=\"key\">{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
+                "<tr><td class=\"key\">{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
                 a(&folder_link(&b.name, ""), &b.name),
                 esc(&b.region),
+                b.versioning.map_or("Off", |v| v.name()),
                 b.objects,
+                b.versions,
                 human(b.bytes),
                 b.multipart_uploads,
                 iso8601(b.created_at_ms)
@@ -280,24 +300,100 @@ fn object_row(bucket: &str, prefix: &str, o: &ObjectInfo) -> String {
     };
     format!(
         "<tr><td class=\"key\">{}</td><td class=\"num\">{}</td><td>{}</td><td><code>{}</code></td></tr>",
-        a(&object_link(bucket, &o.key), name),
+        a(&object_link(bucket, &o.key, None), name),
         human(o.size),
         iso8601(o.last_modified_ms),
         esc(&o.etag)
     )
 }
 
-fn object_page(state: &Shared, bucket: &str, key: &str) -> Result<Response, Page> {
+fn object_page(
+    state: &Shared,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<Response, Page> {
     let ls2 = lock(state)?;
-    let handle = ls2.open_object(bucket, key, None, &ReadCondition::default())?;
-    let head = ls2.read_object(&handle, 0, PREVIEW_BYTES)?;
+    let versioning = ls2.bucket(bucket)?.versioning;
+    let opened = match ls2.open_object(bucket, key, version_id, None, &ReadCondition::default()) {
+        Ok(handle) => {
+            let head = ls2.read_object(&handle, 0, PREVIEW_BYTES)?;
+            Some((handle, head))
+        }
+        // The latest version is a delete marker: still show the version history.
+        Err(Error::DeleteMarker {
+            requested: false, ..
+        }) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let versions = ls2.list_object_versions(
+        bucket,
+        &VersionListRequest {
+            prefix: key.into(),
+            max_keys: PAGE_SIZE,
+            ..Default::default()
+        },
+    )?;
     drop(ls2);
-    let o = &handle.info;
+    let folder = key.rfind('/').map_or("", |i| &key[..=i]);
+    let mut crumbs = crumbs(bucket, folder);
+    crumbs.push(esc(&key[folder.len()..]));
+    let mut body = format!("<h1 class=\"key\">{}</h1>", esc(key));
+    if let Some((handle, head)) = &opened {
+        body += &object_details(bucket, key, version_id, &handle.info, head);
+    } else {
+        body += "<p class=\"muted\">The latest version is a delete marker.</p>";
+    }
+    let history: Vec<_> = versions
+        .versions
+        .iter()
+        .filter(|v| v.info.key == key)
+        .collect();
+    if versioning.is_some() && !history.is_empty() {
+        body += "<h2>Versions</h2><div class=\"table\"><table><tr><th>Version ID</th><th class=\"num\">Size</th><th>Last modified</th><th>ETag</th></tr>";
+        for v in history {
+            let o = &v.info;
+            let id = if v.is_latest {
+                format!(
+                    "{} <span class=\"muted\">(latest)</span>",
+                    esc(&o.version_id)
+                )
+            } else {
+                esc(&o.version_id)
+            };
+            if v.delete_marker {
+                body += &format!(
+                    "<tr><td><code>{id}</code></td><td class=\"num muted\">delete marker</td><td>{}</td><td></td></tr>",
+                    iso8601(o.last_modified_ms)
+                );
+            } else {
+                body += &format!(
+                    "<tr><td><code><a href=\"{}\">{id}</a></code></td><td class=\"num\">{}</td><td>{}</td><td><code>{}</code></td></tr>",
+                    esc(&object_link(bucket, key, Some(&o.version_id))),
+                    human(o.size),
+                    iso8601(o.last_modified_ms),
+                    esc(&o.etag)
+                );
+            }
+        }
+        body += "</table></div>";
+    }
+    Ok(html(key, &crumbs, &body))
+}
+
+fn object_details(
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    o: &ObjectInfo,
+    head: &[u8],
+) -> String {
     let m = &o.metadata;
     let mut rows = vec![
         ("Size", format!("{} ({} bytes)", human(o.size), o.size)),
         ("ETag", format!("<code>{}</code>", esc(&o.etag))),
         ("Last modified", iso8601(o.last_modified_ms)),
+        ("Version ID", format!("<code>{}</code>", esc(&o.version_id))),
     ];
     if let Some(c) = &o.checksum {
         rows.push((
@@ -329,11 +425,10 @@ fn object_page(state: &Shared, bucket: &str, key: &str) -> Result<Response, Page
         );
     }
     let mut body = format!(
-        "<h1 class=\"key\">{}</h1><p class=\"actions\"><a class=\"button\" href=\"{}\">Download</a></p><div class=\"table\"><table>{table}</table></div>",
-        esc(key),
-        esc(&download_link(bucket, key))
+        "<p class=\"actions\"><a class=\"button\" href=\"{}\">Download</a></p><div class=\"table\"><table>{table}</table></div>",
+        esc(&download_link(bucket, key, version_id))
     );
-    if let Some(text) = preview(&head) {
+    if let Some(text) = preview(head) {
         let note = if o.size as usize > head.len() {
             format!(
                 " <span class=\"muted\">(first {})</span>",
@@ -344,10 +439,7 @@ fn object_page(state: &Shared, bucket: &str, key: &str) -> Result<Response, Page
         };
         body += &format!("<h2>Preview{note}</h2><pre>{}</pre>", esc(text));
     }
-    let folder = key.rfind('/').map_or("", |i| &key[..=i]);
-    let mut crumbs = crumbs(bucket, folder);
-    crumbs.push(esc(&key[folder.len()..]));
-    Ok(html(key, &crumbs, &body))
+    body
 }
 
 /// UTF-8 text without NUL bytes; a character cut off by the preview limit is dropped.
@@ -365,9 +457,14 @@ fn preview(bytes: &[u8]) -> Option<&str> {
 }
 
 /// Always an attachment, so stored HTML or SVG never runs in the browser's origin.
-fn download(state: &Shared, bucket: &str, key: &str) -> Result<Response, Page> {
+fn download(
+    state: &Shared,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<Response, Page> {
     let ls2 = lock(state)?;
-    let handle = ls2.open_object(bucket, key, None, &ReadCondition::default())?;
+    let handle = ls2.open_object(bucket, key, version_id, None, &ReadCondition::default())?;
     let info = handle.info.clone();
     let body = object_body(&ls2, state, handle)?;
     drop(ls2);

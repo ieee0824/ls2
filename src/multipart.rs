@@ -1,9 +1,9 @@
 //! Multipart uploads. Parts live in SQLite until completion copies them into object chunks.
 use crate::checksum::{self, Checksum, ChecksumAlgorithm, ChecksumInput};
 use crate::{
-    ByteRange, Error, Ls2, MAX_LIST, MAX_PART_NUMBER, MIN_PART_SIZE, Metadata, ObjectInfo,
-    ReadCondition, WriteCondition, check_write_condition, from_json, key_string, replace_object,
-    require_bucket, to_json, validate_key,
+    ByteRange, CopySource, Error, Ls2, MAX_LIST, MAX_PART_NUMBER, MIN_PART_SIZE, Metadata,
+    ObjectInfo, WriteCondition, bucket_versioning, check_write_condition, from_json, key_string,
+    new_version_id, require_bucket, to_json, validate_key, write_version,
 };
 use md5::{Digest, Md5};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -166,6 +166,7 @@ impl Ls2 {
     }
 
     /// UploadPartCopy: a byte range (or all) of an existing object becomes a part.
+    /// Returns the part and the version ID of the source that was copied.
     #[allow(clippy::too_many_arguments)]
     pub fn upload_part_copy(
         &mut self,
@@ -173,29 +174,36 @@ impl Ls2 {
         key: &str,
         upload_id: &str,
         part_number: u32,
-        src_bucket: &str,
-        src_key: &str,
-        source: &ReadCondition,
+        source: &CopySource,
         range: Option<ByteRange>,
         now_ms: i64,
-    ) -> Result<PartInfo, Error> {
+    ) -> Result<(PartInfo, String), Error> {
         load_upload(&self.conn, bucket, key, upload_id)?;
-        let source = self
-            .get_object(src_bucket, src_key, range, source)
+        crate::resolve_copy_source(&self.conn, source)?;
+        let handle = self
+            .open_object(
+                &source.bucket,
+                &source.key,
+                source.version_id.as_deref(),
+                range,
+                &source.condition,
+            )
             .map_err(|e| match e {
                 Error::NotModified => Error::PreconditionFailed,
                 e => e,
             })?;
-        self.upload_part(
+        let data = self.read_object(&handle, handle.start, (handle.end - handle.start) as usize)?;
+        let part = self.upload_part(
             bucket,
             key,
             upload_id,
             part_number,
-            &source.data,
+            &data,
             ChecksumInput::Default,
             None,
             now_ms,
-        )
+        )?;
+        Ok((part, handle.info.version_id))
     }
 
     /// Assembles the listed parts into an object. Parts must be ascending, match the stored
@@ -256,6 +264,7 @@ impl Ls2 {
             return Err(Error::EntityTooSmall);
         }
         check_write_condition(&tx, bucket, key, condition)?;
+        let versioning = bucket_versioning(&tx, bucket)?;
         let mut digest = Md5::new();
         for part in &stored {
             digest.update(hex_decode(&part.etag));
@@ -268,8 +277,9 @@ impl Ls2 {
             last_modified_ms: now_ms,
             metadata: upload.metadata,
             checksum: None,
+            version_id: new_version_id(versioning),
         };
-        let id = replace_object(&tx, &info)?;
+        let id = write_version(&tx, &info, versioning)?;
         let mut offset = 0u64;
         for (seq, part) in stored.iter().enumerate() {
             if part.size > 0 {
